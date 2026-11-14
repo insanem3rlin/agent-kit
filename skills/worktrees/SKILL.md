@@ -5,11 +5,11 @@ description: Triage, merge, and prune git worktrees created by background/AFK ag
 
 # Worktrees
 
-Sweep the repo's worktrees: figure out which finished their issue, merge those to the default branch + close the issue, prune everything else. This is a recurring chore — background agents spawn worktrees, often named `<topic>-<timestamp>` or `<repo>-issue-<n>`, and most sessions end with the user wanting them cleaned up.
+Sweep the repo's worktrees by working out which finished their issue, merging those to the default branch and closing the issue, and pruning everything else. This is a recurring chore, because background agents spawn worktrees, often named `<topic>-<timestamp>` or `<repo>-issue-<n>`, and most sessions end with the user wanting them cleaned up.
 
-Setup (once, at the start): detect the default branch (`git symbolic-ref refs/remotes/origin/HEAD --short`, referred to below as `<main>`) and the toolchain (`pyproject.toml`/`uv.lock`, `package.json`, `Cargo.toml`, …). Requires an authenticated `gh`. Run from repo root.
+Setup, done once at the start, is to detect the default branch (`git symbolic-ref refs/remotes/origin/HEAD --short`, referred to below as `<main>`) and the toolchain (`pyproject.toml`/`uv.lock`, `package.json`, `Cargo.toml`, …). Requires an authenticated `gh`. Run from repo root.
 
-## Phase 1 — Inventory
+## Phase 1: Inventory
 
 ```
 git worktree list
@@ -22,24 +22,24 @@ For each worktree (skip the main checkout):
   - `git -C <wt> diff --stat <main>...HEAD` (size of work)
   - `git -C <wt> status --porcelain` (uncommitted/dirty?)
 
-Classify each: **done** (issue implemented, committed), **WIP** (partial commits, not finished), **empty** (no real diff). Report the table before acting.
+Classify each as **done** (issue implemented, committed), **WIP** (partial commits, not finished) or **empty** (no real diff). Report the table before acting.
 
-## Phase 2 — Verify the "done" ones
+## Phase 2: Verify the "done" ones
 
 Before merging, prove it works:
-- Run the repo's verify command (the `## Verify` heading in its `AGENTS.md`) when it has one; otherwise run the **fast** tests only, with the repo's toolchain (e.g. `uv run pytest --ignore=tests/ui`, `npm test`) — deselect slow UI/end-to-end/journey dirs; those are slow and the user repeatedly says to skip/stop them.
-- If the user explicitly asked, run UI tests too — but they hang/are slow; if one stalls, stop it rather than blocking.
+- Run the repo's verify command (the `## Verify` heading in its `AGENTS.md`) when it has one; otherwise run the **fast** tests only, with the repo's toolchain (e.g. `uv run pytest --ignore=tests/ui`, `npm test`), and deselect slow UI/end-to-end/journey dirs, since those are slow and the user repeatedly says to skip/stop them.
+- If the user explicitly asked, run UI tests too, but they hang or are slow, so if one stalls, stop it rather than blocking.
 - Dispatch a `reviewer` (Claude Code: the `reviewer` agent, model `opus`) with the range `<main>...<branch>` and the issue text as the spec. Merge on `VERDICT: CLEAN` or `PASS WITH NOTES`; on `NEEDS FIXES` leave the branch unmerged and report the findings. Green tests alone are not a reason to merge.
 
-## Phase 3 — Merge done work
+## Phase 3: Merge done work
 
 Merge to `<main>` **without losing changes already on `<main>`**:
-1. From repo root on `<main>`: `git pull` / ensure up to date.
-2. Merge the worktree branch: `git merge <branch>` — resolve conflicts in favor of keeping both `<main>`'s recent work and the worktree's feature. If the worktree is behind `<main>`, rebase or merge `<main>` into it first so nothing is dropped.
+1. From repo root on `<main>`, run `git pull` or otherwise ensure it is up to date.
+2. Merge the worktree branch: `git merge <branch>`, and resolve conflicts in favor of keeping both `<main>`'s recent work and the worktree's feature. If the worktree is behind `<main>`, rebase or merge `<main>` into it first so nothing is dropped.
 3. Re-run the fast tests after merge if conflicts were resolved.
-4. Close the issue: `gh issue close <n> -c "Merged via <branch>"`.
+4. Close the issue with `gh issue close <n> -c "Merged via <branch>"`.
 
-## Phase 4 — Prune
+## Phase 4: Prune
 
 ```
 git worktree remove <path>          # done & merged, or WIP/empty being discarded
@@ -47,16 +47,16 @@ git worktree prune
 git branch -d <branch>              # -D only if discarding unmerged WIP the user OK'd
 ```
 
-**Known failure (Windows checkouts):** a `.venv/lib64` symlink can cause a permission error during `git worktree remove`. Work around with `git worktree remove --force <path>`, or delete the `.venv` inside the worktree first, then remove.
+On Windows checkouts, a `.venv/lib64` symlink can cause a permission error during `git worktree remove`. Work around it with `git worktree remove --force <path>`, or delete the `.venv` inside the worktree first, then remove.
 
-**Known failure (Windows checkouts):** deleting agent-created worktrees can fail with `Filename too long`. Ensure `git config core.longpaths true` is set in the repo, then retry with `git worktree remove --force <path>`.
+Also on Windows checkouts, deleting agent-created worktrees can fail with `Filename too long`. Ensure `git config core.longpaths true` is set in the repo, then retry with `git worktree remove --force <path>`.
 
 ## Policy
 
-- **done** → verify → review → merge → close issue → prune.
-- **WIP** → do NOT merge unless told; prune only on user confirmation (work is lost).
-- **empty** → safe to prune.
-- A "None"/stale worktree entry → `git worktree prune`.
+- A **done** worktree is verified, reviewed, merged, its issue closed, and then pruned.
+- A **WIP** worktree is NOT merged unless the user says so, and is pruned only on user confirmation (work is lost).
+- An **empty** worktree is safe to prune.
+- A "None"/stale worktree entry is handled with `git worktree prune`.
 
 ## Confirm before destroying
 

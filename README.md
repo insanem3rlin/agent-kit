@@ -16,6 +16,8 @@ git clone https://github.com/insanem3rlin/agent-kit.git ~/.agent-kit
 ~/.agent-kit/install.sh
 ```
 
+To have an agent do it, tell it: "Install https://github.com/insanem3rlin/agent-kit by following its INSTALL.md." The file [`INSTALL.md`](INSTALL.md) is written for that agent.
+
 The installer links the kit into each tool it finds and adds an hourly timer that pulls the repository, refreshes the external skills and re-links. It never overwrites: something already present under a name the kit wants is reported as a conflict and left alone. `install.sh --adopt` moves such entries to a backup directory and links the kit's version.
 
 ```sh
