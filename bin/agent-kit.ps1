@@ -23,7 +23,7 @@ if (-not $py) {
     foreach ($c in $found) { $py = Test-Python $c.Source; if ($py) { break } }
 }
 if (-not $py -and (Get-Command uv -ErrorAction SilentlyContinue)) {
-    $p = & uv python find '>=3.10' 2>$null
+    $p = & uv python find --system '>=3.10' 2>$null
     if ($LASTEXITCODE -eq 0 -and $p) { $py = Test-Python "$p".Trim() }
 }
 if (-not $py) {

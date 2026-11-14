@@ -854,7 +854,7 @@ def install_task(manifest):
     # schtasks cannot say "run on battery" or "catch up a missed run"; cron has
     # neither condition, so set both. Re-applied on every install.
     if act(f"allow {TASK_NAME} on battery"):
-        r = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+        r = run([shutil.which("powershell") or "powershell", "-NoProfile", "-NonInteractive", "-Command",
                  f"Set-ScheduledTask -TaskName {TASK_NAME} -Settings (New-ScheduledTaskSettingsSet "
                  "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) | Out-Null"])
         if r.returncode != 0:
