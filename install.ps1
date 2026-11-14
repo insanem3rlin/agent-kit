@@ -1,6 +1,6 @@
 # Bootstrap agent-kit on Windows: clone (if needed), then run `agent-kit install`.
 # Usage: install.ps1 [--dry-run] [--adopt] [--no-timer]
-$ErrorActionPreference = 'Stop'
+# Exit codes are checked by hand; see bin\agent-kit.ps1 for why there is no 'Stop'.
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
     Write-Host 'agent-kit: git is required'

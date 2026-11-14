@@ -10,6 +10,7 @@ AGENT_KIT_CACHE, AGENT_KIT_STATE.
 import argparse
 import copy
 import datetime
+import errno
 import json
 import os
 import re
@@ -138,7 +139,9 @@ def write_atomic(path, text):
     path = Path(path)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        # Text is read with universal newlines; a file that had CRLF gets CRLF back.
+        crlf = path.is_file() and b"\r\n" in path.read_bytes()
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n" if crlf else "") as f:
             f.write(text)
         if path.exists():
             shutil.copymode(path, tmp)
@@ -404,7 +407,9 @@ def link_target(path):
     """Where a link points, made absolute. Windows reports `\\\\?\\C:\\...`; the
     prefix is dropped so the path compares equal to the kit's own paths."""
     t = os.readlink(path)
-    if WINDOWS and t.startswith("\\\\?\\"):
+    if WINDOWS and t.startswith("\\\\?\\UNC\\"):
+        t = "\\\\" + t[8:]
+    elif WINDOWS and t.startswith("\\\\?\\"):
         t = t[4:]
     return os.path.normpath(os.path.join(os.path.dirname(str(path)), t))
 
@@ -556,7 +561,7 @@ def rules_targets(kit):
 
 def read_text_or_none(p):
     try:
-        return Path(p).read_text(encoding="utf-8")
+        return Path(p).read_text(encoding="utf-8-sig")   # PS 5.1 writes a BOM
     except FileNotFoundError:
         return None
 
@@ -838,20 +843,28 @@ def install_task(manifest):
     cur = task_exists()
     if cur is None:
         return say(f"no schtasks available; schedule this hourly yourself:\n  {cmd}")
-    if cur:
-        manifest["cron"] = True
-        return
-    if act(f"add hourly scheduled task {TASK_NAME}: {cmd}"):
-        r = run(["schtasks", "/Create", "/F", "/SC", "HOURLY", "/ST", "00:17",
+    if not cur:
+        if not act(f"add hourly scheduled task {TASK_NAME}: {cmd}"):
+            return
+        r = run([shutil.which("schtasks"), "/Create", "/F", "/SC", "HOURLY", "/ST", "00:17",
                  "/TN", TASK_NAME, "/TR", cmd])
         if r.returncode != 0:
             return fail("schtasks /Create failed: " + (r.stderr or r.stdout).strip())
-        manifest["cron"] = True
+    manifest["cron"] = True
+    # schtasks cannot say "run on battery" or "catch up a missed run"; cron has
+    # neither condition, so set both. Re-applied on every install.
+    if act(f"allow {TASK_NAME} on battery"):
+        r = run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Set-ScheduledTask -TaskName {TASK_NAME} -Settings (New-ScheduledTaskSettingsSet "
+                 "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) | Out-Null"])
+        if r.returncode != 0:
+            say(f"note: {TASK_NAME} keeps the default battery conditions: "
+                + (r.stderr or r.stdout).strip())
 
 
 def remove_task():
     if task_exists() and act(f"remove scheduled task {TASK_NAME}"):
-        r = run(["schtasks", "/Delete", "/F", "/TN", TASK_NAME])
+        r = run([shutil.which("schtasks"), "/Delete", "/F", "/TN", TASK_NAME])
         if r.returncode != 0:
             fail("schtasks /Delete failed: " + (r.stderr or r.stdout).strip())
 
@@ -907,9 +920,11 @@ def read_manifest():
     return m, None
 
 
-def remove_cron_line():
+def remove_cron_line(manifest):
     if WINDOWS:
-        return remove_task()
+        # A scheduled task is machine-wide, not per HOME or state directory, so
+        # only the install that recorded it may remove it.
+        return remove_task() if manifest.get("cron") else None
     cur = read_cron()
     if cur is None:
         return
@@ -956,7 +971,7 @@ def cmd_uninstall(args):
             write_atomic(real, new)
     if m["settings"]:
         step("settings", unmerge_settings, m["settings"])
-    step("cron", remove_cron_line)
+    step("cron", remove_cron_line, m)
     if not RUN["dry"] and not RUN["failed"]:
         (state_dir() / "manifest.json").unlink(missing_ok=True)
     say("left in place:")
@@ -1117,11 +1132,13 @@ def main(argv=None):
         state_dir().mkdir(parents=True, exist_ok=True)
         lock = open(state_dir() / "lock", "a")
         try:
-            if WINDOWS:     # raises OSError when another run holds byte 0
+            if WINDOWS:     # EACCES/EDEADLOCK when another run holds byte 0
                 try:
                     msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
                 except OSError as e:
-                    raise BlockingIOError(str(e)) from e
+                    if e.errno in (errno.EACCES, errno.EDEADLOCK):
+                        raise BlockingIOError(str(e)) from e
+                    raise
             else:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:

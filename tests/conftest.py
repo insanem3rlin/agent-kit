@@ -58,6 +58,10 @@ class Env:
             p = self.bin / name
             p.write_text(body)
             p.chmod(0o755)
+        # Scheduled tasks are machine-wide: a fake answers "the task exists" and
+        # logs every call, so no test reaches the real Task Scheduler.
+        (self.bin / "schtasks.cmd").write_text(
+            '@echo %* >> "%FAKE_STATE%\\schtasks.log"\r\n@exit /b 0\r\n')
         self._make_kit()
 
     def _make_kit(self):
