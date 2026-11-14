@@ -25,7 +25,7 @@ powershell -ExecutionPolicy Bypass -File ~\.agent-kit\install.ps1
 
 There `bin\agent-kit.ps1` stands in for `bin/agent-kit` (it finds a real Python 3.10+), and the hourly timer is the scheduled task `agent-kit-sync`.
 
-To have an agent do it, tell it: "Install https://github.com/insanem3rlin/agent-kit by following its INSTALL.md." The file [`INSTALL.md`](INSTALL.md) is written for that agent.
+To have an agent do it (Claude Code, Codex or Hermes), tell it: "Install https://github.com/insanem3rlin/agent-kit by following its INSTALL.md." The file [`INSTALL.md`](INSTALL.md) is written for that agent. After the install it also audits the rules and skills already on the machine and in your repositories, removes what the kit now duplicates, and reports conflicts and leaked secrets.
 
 The installer links the kit into each tool it finds and adds an hourly timer that pulls the repository, refreshes the external skills and re-links. It never overwrites: something already present under a name the kit wants is reported as a conflict and left alone. `install.sh --adopt` moves such entries to a backup directory and links the kit's version.
 

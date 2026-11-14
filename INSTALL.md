@@ -57,6 +57,28 @@ Check these and stop with a clear message if one fails.
 
    The install is done when `doctor` exits 0, or when its only complaints are the conflicts the user chose to keep.
 
+6. Audit the rules and skills that were on the machine before. The kit is now the machine-wide source for its rules and skills, so other copies either repeat it or contradict it. Where your tool can delegate, give the reading to a read-only subagent (the `researcher` role) and keep its findings, each with file and line, rather than the file contents. Re-read each file yourself before you edit it.
+
+   Read, for each tool that was found:
+
+   - Machine level: `~/.claude/CLAUDE.md`, `~/.claude/skills/`, `~/.claude/agents/` and the enabled plugins in `~/.claude/settings.json`; `~/.codex/AGENTS.md`, `~/.codex/skills/` and `~/.agents/skills/`; `~/.hermes/SOUL.md` and `~/.hermes/skills/`; and the rules files of any other agent tool the user names. Skip the kit's own marked blocks (`<!-- agent-kit:begin -->` to `<!-- agent-kit:end -->`) and the links the kit made.
+   - Repository level: ask the user where their repositories are. In each one, read `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json`, `.claude/skills/` and `.agents/skills/`, and run `git shortlog -sn --all` (it works in sh and PowerShell) to see everyone who ever committed there.
+
+   Sort what you find against `~/.agent-kit/rules/AGENTS.md` and `~/.agent-kit/skills/`:
+
+   - Duplicate: says what a kit rule or kit skill already says.
+   - Conflict: contradicts a kit rule, for example committing, pushing or messaging people without approval, or adding an attribution line.
+   - Own: specific to the user or the project. It stays.
+   - Leak: a secret, host address or account ID in a tracked file. Note its kind, never its value.
+
+   Before removing anything, copy the file or skill folder to `~/.local/state/agent-kit/backup/manual-<UTC timestamp>/`, under its path relative to the home directory (outside home, under its absolute path with the drive letter or root as the first folder, such as `D/src/app/AGENTS.md`), so a second run or a second tool never overwrites an earlier copy. Then handle each finding like this:
+
+   - A machine-level duplicate: remove the duplicated lines or skill. Step 3 already settled skills that clash with a kit skill in the folders the installer links into, but a copy of a kit skill in `~/.codex/skills` is a duplicate to remove here. Copies of a Claude plugin's skills under `~/.codex/skills` or `~/.agents/skills` are how Codex gets them, so they are not duplicates. A plugin that duplicates a kit skill: report it and let the user disable the plugin; never edit a plugin's files.
+   - A machine-level conflict: show it to the user and change nothing until they decide.
+   - A repository duplicate: remove it only where the user is the only person in `git shortlog` (their own agents count as the user). In a shared repository, colleagues without the kit would lose the rule, so report it instead, and ask the user when you cannot tell who an author is. A line that only repeats what the repository already enforces itself (a plugin it enables, a hook it runs) can go in either case. Edit the working tree only and commit nothing.
+   - A repository conflict: report it. A repository's rules win over the kit's for that repository, and projects differ on purpose.
+   - A leak: report the file, the line and the kind of secret. Do not edit it.
+
 ## What the install changes
 
 Tell the user this list in your report, limited to the tools that were found.
@@ -71,7 +93,7 @@ Permission modes, secrets and the session's model are left alone.
 
 ## Rules for you while installing
 
-- Run the commands above as written. Edit no file under `~/.claude`, `~/.hermes` or `~/.codex` by hand, and do not create the links yourself.
+- Run the commands above as written. Edit no file under `~/.claude`, `~/.hermes` or `~/.codex` by hand except for the step 6 removals, never inside the kit's marked blocks, and do not create the links yourself.
 - Use `--adopt` only after the user chose it in step 3.
 - If a step fails, show the command and its output, and stop. Do not work around a failure by deleting or moving the user's files.
 - Leave the statusline's usage lookup off. It needs the user's login token, and only the user turns it on, in `~/.config/agent-kit/statusline.json` (the header of `~/.agent-kit/adapters/claude-code/statusline.py` describes the two keys).
@@ -79,7 +101,7 @@ Permission modes, secrets and the session's model are left alone.
 
 ## Report
 
-State which tools were found, what was linked for each, which conflicts existed and what the user chose, the output of `doctor`, and the backup folder when `--adopt` was used.
+State which tools were found, what was linked for each, which conflicts existed and what the user chose, the output of `doctor`, and the backup folder when `--adopt` was used. From the audit, list what you removed and where its backup is, then the conflicts, the leaks and the duplicates left in shared repositories, each with file and line.
 
 ## Removing it
 
