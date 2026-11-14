@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "AfterTool": [
+      {
+        "matcher": "write_file|replace",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "{PYTHON} {KIT}/hooks/context7_reminder.py"
+          }
+        ]
+      }
+    ]
+  }
+}
