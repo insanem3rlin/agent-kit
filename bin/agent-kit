@@ -1,0 +1,1021 @@
+#!/usr/bin/env python3
+"""agent-kit: link a shared set of agent rules, skills and hooks into every
+agent tool on this machine (Claude Code, Hermes, Codex).
+
+Subcommands: install, sync, doctor, uninstall. Standard library only.
+
+Locations (all overridable for tests): AGENT_KIT_HOME, HOME, AGENT_KIT_CONFIG,
+AGENT_KIT_CACHE, AGENT_KIT_STATE.
+"""
+import argparse
+import copy
+import datetime
+import fcntl
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BEGIN = "<!-- agent-kit:begin -->"
+END = "<!-- agent-kit:end -->"
+CRON_TAG = "# agent-kit"
+SOURCES_SCHEMA = 1
+RUN = {"quiet": False, "dry": False, "failed": False}
+
+
+# ---------------------------------------------------------------- reporting
+
+def say(msg):
+    if not RUN["quiet"]:
+        print(msg)
+
+
+def fail(msg):
+    RUN["failed"] = True
+    print("error: " + msg, file=sys.stderr)
+
+
+def act(msg):
+    """Report an action; True when it should really be performed."""
+    say(("would " if RUN["dry"] else "") + msg)
+    return not RUN["dry"]
+
+
+# ---------------------------------------------------------------- locations
+
+def kit_dir():
+    v = os.environ.get("AGENT_KIT_HOME")
+    return Path(os.path.abspath(v)) if v else Path(__file__).resolve().parent.parent
+
+
+def _dir(var, rel):
+    v = os.environ.get(var)
+    return Path(os.path.abspath(v)) if v else Path.home() / rel
+
+
+def config_dir():
+    return _dir("AGENT_KIT_CONFIG", ".config/agent-kit")
+
+
+def cache_dir():
+    return _dir("AGENT_KIT_CACHE", ".cache/agent-kit")
+
+
+def state_dir():
+    return _dir("AGENT_KIT_STATE", ".local/state/agent-kit")
+
+
+def tools():
+    h = Path.home()
+    return {"claude": (h / ".claude").exists(), "hermes": (h / ".hermes").exists(),
+            "codex": (h / ".codex").exists(),
+            "agents": (h / ".agents").exists() or (h / ".codex").exists()}
+
+
+def skill_targets():
+    """(label, resolved directory) per tool, de-duplicated by realpath."""
+    h, t = Path.home(), tools()
+    cands = [(lbl, h / rel) for lbl, rel, on in (
+        ("claude", ".claude/skills", t["claude"]),
+        ("hermes", ".hermes/skills", t["hermes"]),
+        ("agents", ".agents/skills", t["agents"])) if on]
+    seen = {}
+    for lbl, p in cands:
+        seen.setdefault(os.path.realpath(p), lbl)
+    return [(lbl, Path(real)) for real, lbl in seen.items()]
+
+
+# ---------------------------------------------------------------- manifest
+
+def load_manifest():
+    p = state_dir() / "manifest.json"
+    m = {}
+    if p.exists():
+        try:
+            m = json.loads(p.read_text())
+        except ValueError:
+            fail(f"{p} is not valid JSON; starting a fresh manifest")
+    m.setdefault("links", {})
+    m.setdefault("blocks", {})
+    m.setdefault("settings", {})
+    m.setdefault("cron", False)
+    return m
+
+
+def save_manifest(m):
+    if RUN["dry"]:
+        return
+    p = state_dir() / "manifest.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(p, json.dumps(m, indent=2) + "\n")
+
+
+def write_atomic(path, text):
+    path = Path(path)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        if path.exists():
+            shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+# ---------------------------------------------------------------- git helpers
+
+TIMEOUTS = {"net": 120, "plugin": 300, "other": 30}
+
+
+def run(cmd, kind="other", env=None, cwd=None, input=None):
+    """subprocess.run with no stdin, a timeout and the whole process group killed
+    on expiry. A timeout comes back as returncode 124 with the reason in stderr."""
+    limit = float(os.environ.get("AGENT_KIT_TIMEOUT") or TIMEOUTS[kind])
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, text=True, start_new_session=True,
+                             stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError as e:
+        return subprocess.CompletedProcess(cmd, 127, "", str(e))
+    try:
+        out, err = p.communicate(input, timeout=limit)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        p.communicate()
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {limit:g}s")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def git(args, cwd=None, net=False, ceiling=None):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    if ceiling:
+        env["GIT_CEILING_DIRECTORIES"] = str(ceiling)
+    return run(["git"] + list(args), kind="net" if net else "other", env=env, cwd=cwd)
+
+
+def rev(path, ceiling=None):
+    r = git(["rev-parse", "--short", "HEAD"], cwd=path, ceiling=ceiling)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+# ---------------------------------------------------------------- 1. self-update
+
+def self_update(kit):
+    if git(["rev-parse", "--git-dir"], cwd=kit).returncode != 0:
+        say("self-update skipped: not a git checkout")
+    elif git(["rev-parse", "--abbrev-ref", "@{u}"], cwd=kit).returncode != 0:
+        say("self-update skipped: no upstream")
+    elif git(["status", "--porcelain", "--untracked-files=no"], cwd=kit).stdout.strip():
+        say("self-update skipped: working tree is dirty")
+    else:
+        before = rev(kit)
+        if not act(f"pull kit {kit}"):
+            return
+        r = git(["pull", "--ff-only", "--quiet"], cwd=kit, net=True)
+        if r.returncode != 0:
+            return fail("git pull --ff-only failed: " + r.stderr.strip())
+        if rev(kit) == before:
+            return
+        say(f"updated kit {before} -> {rev(kit)}")
+
+
+# ---------------------------------------------------------------- 2. sources
+
+def load_sources(kit):
+    p = kit / "sources.json"
+    if not p.exists():
+        return {"sources": [], "claude_plugins": []}
+    data = json.loads(p.read_text())
+    if data.get("schema") != SOURCES_SCHEMA:
+        raise ValueError(f"{p}: unknown schema {data.get('schema')!r} (expected {SOURCES_SCHEMA})")
+    return data
+
+
+def valid_url(url):
+    if not isinstance(url, str) or url.startswith("-") or not url:
+        return False
+    if url.startswith("https://"):
+        return True
+    return bool(os.environ.get("AGENT_KIT_ALLOW_LOCAL_SOURCES"))  # tests: local repos
+
+
+def valid_ref(ref):
+    return ref is None or (isinstance(ref, str) and
+                           re.fullmatch(r"[A-Za-z0-9._/][A-Za-z0-9._/-]*", ref) is not None)
+
+
+def source_dir(url, cache):
+    parts = [x for x in re.split(r"[/:]+", url.strip()) if x]
+    repo = re.sub(r"\.git$", "", parts[-1])
+    name = f"{parts[-2]}__{repo}"
+    if not re.fullmatch(r"[A-Za-z0-9][\w.-]*__[A-Za-z0-9][\w.-]*", name):
+        raise ValueError(f"cannot derive a safe mirror name from {url!r}")
+    return cache / "sources" / name
+
+
+MIRROR_MARKER = "agent-kit-mirror"   # written into .git of every mirror the kit clones
+
+
+def owned_mirror(d):
+    """True when d is a directory the kit itself cloned (it carries the marker)."""
+    return (not d.is_symlink()) and d.is_dir() and (d / ".git" / MIRROR_MARKER).is_file()
+
+
+def healthy_mirror(d, url):
+    """True when d is the kit's own checkout of url (not a leftover inside another repo)."""
+    if not owned_mirror(d):
+        return False
+    top = git(["rev-parse", "--show-toplevel"], cwd=d, ceiling=d.parent)
+    if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(d):
+        return False
+    # `config --get`, not `remote get-url`: the latter applies insteadOf rewrites.
+    origin = git(["config", "--get", "remote.origin.url"], cwd=d, ceiling=d.parent)
+    return origin.returncode == 0 and origin.stdout.strip() == url
+
+
+def remove_mirror(d, cache):
+    """Remove a mirror the kit cloned. Anything without the kit's marker is
+    someone else's (the cache may be a link into foreign ground) and is refused."""
+    root = os.path.realpath(cache / "sources")
+    if not os.path.realpath(d).startswith(root + os.sep):
+        raise ValueError(f"refusing to remove {d}: outside {root}")
+    if not owned_mirror(d):
+        raise ValueError(f"refusing to remove {d}: not a mirror the kit cloned; "
+                         "move it away by hand")
+    shutil.rmtree(d)
+
+
+def fetch_source(src, cache):
+    """Clone or hard-reset the mirror; returns (directory, refreshed)."""
+    url, ref = src["repo"], src.get("ref")
+    d = source_dir(url, cache)
+    ceiling = d.parent
+    if os.path.lexists(d) and healthy_mirror(d, url):
+        before = rev(d, ceiling)
+        if not act(f"update {url}"):
+            return d, True
+        r = git(["fetch", "--quiet", "--depth", "1", "--", "origin", ref or "HEAD"],
+                cwd=d, net=True, ceiling=ceiling)
+        if r.returncode == 0:
+            r = git(["reset", "--quiet", "--hard", "FETCH_HEAD"], cwd=d, ceiling=ceiling)
+        if r.returncode != 0:
+            fail(f"update of {url} failed: {r.stderr.strip()}")
+            return d, False
+        if rev(d, ceiling) != before:
+            say(f"  {before} -> {rev(d, ceiling)}")
+        return d, True
+    if os.path.lexists(d) and not owned_mirror(d):
+        fail(f"{d} exists and is not a mirror the kit cloned; move it away by hand")
+        return d, False
+    if not act(f"{'re-clone' if os.path.lexists(d) else 'clone'} {url}"):
+        return d, True
+    d.parent.mkdir(parents=True, exist_ok=True)
+    # Clone beside the final place and rename, so the final directory only ever
+    # appears complete and marked. The temporary directory is ours by creation.
+    tmp = Path(tempfile.mkdtemp(prefix=d.name + ".tmp-", dir=str(d.parent)))
+    try:
+        cmd = ["clone", "--quiet", "--depth", "1"] + (["--branch", ref] if ref else []) + \
+              ["--", url, str(tmp)]
+        r = git(cmd, net=True, ceiling=ceiling)
+        if r.returncode != 0:
+            fail(f"clone of {url} failed: {r.stderr.strip()}")
+            return d, False
+        (tmp / ".git" / MIRROR_MARKER).write_text("cloned by agent-kit\n")
+        if os.path.lexists(d):
+            remove_mirror(d, cache)
+        os.rename(tmp, d)
+    except (OSError, ValueError) as e:
+        fail(f"clone of {url} failed: {e}")
+        return d, False
+    finally:
+        if tmp.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+    return d, True
+
+
+def sync_sources(data, cache):
+    """Returns ([(skill name, directory)], degraded)."""
+    found, degraded = [], False
+    for src in data.get("sources", []):
+        if not valid_url(src.get("repo")) or not valid_ref(src.get("ref")):
+            fail(f"source {src.get('repo')!r} ref {src.get('ref')!r}: only https:// URLs "
+                 "and plain ref names are accepted")
+            degraded = True
+            continue
+        try:
+            d, ok = fetch_source(src, cache)
+        except (ValueError, OSError) as e:
+            fail(f"{src['repo']}: {e}")
+            degraded = True
+            continue
+        degraded = degraded or not ok
+        if not ok and not (d / ".git").exists():
+            continue
+        for sk in src.get("skills", []):
+            name, path = sk["name"], sk.get("path", ".")
+            if (not re.fullmatch(r"[A-Za-z0-9][\w.-]*", name) or os.path.isabs(path)
+                    or ".." in Path(path).parts):
+                fail(f"{src['repo']}: bad skill entry {name!r} / {path!r}")
+                continue
+            sd = d / path if path != "." else d
+            if RUN["dry"] and not d.exists():
+                found.append((name, sd))      # would exist after the clone
+            elif not os.path.realpath(sd).startswith(os.path.realpath(d) + os.sep) \
+                    and os.path.realpath(sd) != os.path.realpath(d):
+                fail(f"{src['repo']}: skill {name!r} resolves outside the mirror")
+            elif not (sd / "SKILL.md").is_file():
+                fail(f"{src['repo']}: skill {name!r} has no SKILL.md at {path!r}")
+            else:
+                found.append((name, sd))
+    return found, degraded
+
+
+# ---------------------------------------------------------------- 3/4. links
+
+def kit_skills(kit):
+    root = kit / "skills"
+    if not root.is_dir():
+        return []
+    return [(d.name, d) for d in sorted(root.iterdir())
+            if not d.name.startswith(".") and (d / "SKILL.md").is_file()]
+
+
+def inside(p, roots):
+    forms = {os.path.normpath(p), os.path.realpath(p)}
+    for r in roots:
+        for rr in {os.path.normpath(r), os.path.realpath(r)}:
+            if any(f == rr or f.startswith(rr + os.sep) for f in forms):
+                return True
+    return False
+
+
+def plan_link(path, target, roots):
+    """One of: ok, create, repoint, conflict."""
+    path = str(path)
+    if os.path.islink(path):
+        if os.path.realpath(path) == os.path.realpath(str(target)):
+            return "ok"
+        cur = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        return "repoint" if inside(cur, roots) else "conflict"
+    return "conflict" if os.path.lexists(path) else "create"
+
+
+def make_link(path, target):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(str(target), str(path))
+    except FileExistsError:
+        if not path.is_symlink():
+            raise
+        if os.path.realpath(path) == os.path.realpath(str(target)):
+            return
+        tmp = path.with_name(f".{path.name}.agent-kit-{os.getpid()}")
+        os.symlink(str(target), str(tmp))
+        os.replace(str(tmp), str(path))     # atomic re-point
+
+
+def link_one(path, target, label, manifest, adopt, stamp, roots):
+    path = Path(path)
+    plan = plan_link(path, target, roots)
+    if plan == "ok":
+        if not RUN["dry"]:
+            manifest["links"][str(path)] = str(target)
+        return
+    if plan == "conflict":
+        if not adopt:
+            return fail(f"conflict: {path} exists and is not provided by agent-kit "
+                        "(left untouched; --adopt backs it up and links)")
+        dest = state_dir() / "backup" / stamp / label / path.name
+        if act(f"back up {path} -> {dest}"):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(path), str(dest))
+    verb = "repoint" if plan == "repoint" else "link"
+    if act(f"{verb} {path} -> {target}"):
+        make_link(path, target)
+        manifest["links"][str(path)] = str(target)
+
+
+def prune_links(directory, wanted, roots, manifest):
+    """Remove links of ours (into roots) whose entry is no longer provided."""
+    if not directory.is_dir():
+        return
+    for p in sorted(directory.iterdir()):
+        if p.name in wanted or not p.is_symlink():
+            continue
+        cur = os.path.normpath(os.path.join(str(directory), os.readlink(p)))
+        if inside(cur, roots):
+            if act(f"remove stale link {p}"):
+                p.unlink()
+            manifest["links"].pop(str(p), None)
+
+
+def link_skills(kit, external, manifest, adopt, stamp, degraded=False):
+    provided = dict(kit_skills(kit))
+    for name, d in external:
+        if name in provided:
+            say(f"note: external skill {name} shadowed by the kit's own")
+        else:
+            provided[name] = d
+    roots = [kit, cache_dir()]
+    prune_roots = [kit / "skills"] + ([] if degraded else [cache_dir() / "sources"])
+    for label, tdir in skill_targets():
+        for name, d in sorted(provided.items()):
+            link_one(tdir / name, d, label, manifest, adopt, stamp, roots)
+        prune_links(tdir, provided, prune_roots, manifest)
+    return provided
+
+
+def link_agents(kit, manifest, adopt, stamp):
+    if not tools()["claude"]:
+        return
+    src = sorted((kit / "adapters/claude-code/agents").glob("*.md"))
+    tdir = Path.home() / ".claude/agents"
+    for f in src:
+        link_one(tdir / f.name, f, "claude-agents", manifest, adopt, stamp, [kit])
+    prune_links(tdir, {f.name for f in src}, [kit / "adapters"], manifest)
+
+
+# ---------------------------------------------------------------- 5. rules
+
+def block(body):
+    return f"{BEGIN}\n{body.rstrip(chr(10))}\n{END}"
+
+
+def check_markers(cur):
+    """Raise ValueError unless cur has no markers or exactly one begin then one end."""
+    b, e = cur.count(BEGIN), cur.count(END)
+    if (b, e) == (0, 0) or (b == e == 1 and cur.find(BEGIN) < cur.find(END)):
+        return
+    raise ValueError(f"unexpected agent-kit markers ({b} begin, {e} end, or wrong order); "
+                     "fix the file by hand, it was left untouched")
+
+
+def with_block(cur, blk):
+    i = cur.find(BEGIN)
+    j = cur.find(END, i) if i >= 0 else -1
+    if j > i >= 0:
+        return cur[:i] + blk + cur[j + len(END):]
+    if not cur:
+        return blk + "\n"
+    return cur + ("" if cur.endswith("\n") else "\n") + "\n" + blk + "\n"
+
+
+def without_block(cur):
+    i = cur.find(BEGIN)
+    j = cur.find(END, i) if i >= 0 else -1
+    if not j > i >= 0:
+        return cur
+    before, after = cur[:i], cur[j + len(END):]
+    if after.startswith("\n"):
+        after = after[1:]
+    if before.endswith("\n\n") and not after:
+        before = before[:-1]
+    return before + after
+
+
+def rules_targets(kit):
+    """(file, body) per tool that wants the rules text."""
+    h, t = Path.home(), tools()
+    rules = kit / "rules" / "AGENTS.md"
+    out = []
+    if t["claude"]:
+        out.append((h / ".claude/CLAUDE.md", f"@{rules}"))
+    if rules.is_file():
+        if t["hermes"]:
+            out.append((h / ".hermes/SOUL.md", rules.read_text()))
+        if t["codex"]:
+            out.append((h / ".codex/AGENTS.md", rules.read_text()))
+    return out
+
+
+def read_text_or_none(p):
+    try:
+        return Path(p).read_text()
+    except FileNotFoundError:
+        return None
+
+
+def sync_rules(kit, manifest):
+    if not (kit / "rules" / "AGENTS.md").is_file():
+        return fail(f"{kit}/rules/AGENTS.md is missing")
+    for path, body in rules_targets(kit):
+        real = os.path.realpath(path)
+        cur = read_text_or_none(real)
+        try:
+            if BEGIN in body or END in body:
+                raise ValueError("the rules text itself contains an agent-kit marker")
+            check_markers(cur or "")
+        except ValueError as e:
+            fail(f"{real}: {e}")
+            continue
+        new = with_block(cur or "", block(body))
+        if cur == new:
+            manifest["blocks"].setdefault(real, {"created": False})
+            continue
+        if act(f"{'create' if cur is None else 'update'} rules block in {real}"):
+            Path(real).parent.mkdir(parents=True, exist_ok=True)
+            write_atomic(real, new)
+            manifest["blocks"].setdefault(real, {"created": cur is None})
+
+
+# ---------------------------------------------------------------- 6. settings
+
+def load_fragment(kit):
+    p = kit / "adapters/claude-code/settings.fragment.json"
+    if not p.is_file():
+        return None
+    quoted = shlex.quote(str(kit))
+
+    def subst(o):
+        if isinstance(o, str):
+            return o.replace("{KIT}", quoted)
+        if isinstance(o, list):
+            return [subst(x) for x in o]
+        if isinstance(o, dict):
+            return {k: subst(v) for k, v in o.items()}
+        return o
+    return subst(json.loads(p.read_text()))
+
+
+def scripts_in(cmd):
+    try:
+        return [t for t in shlex.split(cmd) if t.endswith(".py")]
+    except ValueError:
+        return []
+
+
+def script_missing(cmd):
+    return any(not os.path.exists(s) for s in scripts_in(cmd))
+
+
+def event_mentions(entries, cmd):
+    names = [os.path.basename(s) for s in scripts_in(cmd)] or [cmd]
+    for e in entries:
+        for h in e.get("hooks", []):
+            c = h.get("command", "")
+            if any(n in c for n in names):
+                return True
+    return False
+
+
+def merge_settings(settings, frag):
+    """Add what is missing; returns {env, statusLine, hooks, created}."""
+    added = {"env": [], "statusLine": None, "hooks": [], "created": []}
+    env = frag.get("env", {})
+    if env and isinstance(settings.get("env", {}), dict):
+        if "env" not in settings:
+            settings["env"] = {}
+            added["created"].append("env")
+        for k, v in env.items():
+            if k not in settings["env"]:
+                settings["env"][k] = v
+                added["env"].append(k)
+    sl = frag.get("statusLine")
+    if sl and "statusLine" not in settings and not script_missing(sl.get("command", "")):
+        settings["statusLine"] = sl
+        added["statusLine"] = sl
+        added["created"].append("statusLine")
+    for event, entries in frag.get("hooks", {}).items():
+        have = settings.get("hooks", {}).get(event, [])
+        for entry in entries:
+            keep = [h for h in entry.get("hooks", [])
+                    if not script_missing(h.get("command", ""))
+                    and not event_mentions(have, h.get("command", ""))]
+            if not keep:
+                continue
+            new = dict(entry, hooks=keep)
+            if "hooks" not in settings:
+                settings["hooks"] = {}
+                added["created"].append("hooks")
+            settings["hooks"].setdefault(event, []).append(new)
+            have = settings["hooks"][event]
+            added["hooks"].append({"event": event, "entry": new})
+    return added
+
+
+def read_settings(real):
+    """(data or None, error or None); missing file gives ({}, None)."""
+    text = read_text_or_none(real)
+    if text is None:
+        return {}, None
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        return None, f"{real} is not valid JSON ({e}); left alone"
+    if not isinstance(data, dict):
+        return None, f"{real} is not a JSON object; left alone"
+    return data, None
+
+
+def sync_settings(kit, manifest):
+    if not tools()["claude"]:
+        return
+    frag = load_fragment(kit)
+    if frag is None:
+        return say("settings skipped: no settings.fragment.json in the kit")
+    real = os.path.realpath(Path.home() / ".claude/settings.json")
+    data, err = read_settings(real)
+    if err:
+        return fail(err)
+    existed = os.path.exists(real)
+    added = merge_settings(data, frag)
+    if not (added["env"] or added["statusLine"] or added["hooks"]):
+        return
+    parts = [f"env {k}" for k in added["env"]]
+    parts += ["statusLine"] if added["statusLine"] else []
+    parts += [f"hook {h['event']}" for h in added["hooks"]]
+    if not act(f"update {real}: add " + ", ".join(parts)):
+        return
+    bak = real + ".agent-kit.bak"
+    if existed and not os.path.exists(bak):
+        shutil.copy2(real, bak)
+    Path(real).parent.mkdir(parents=True, exist_ok=True)
+    write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    rec = manifest["settings"]
+    rec.setdefault("file", real)
+    rec.setdefault("file_created", not existed)
+    rec.setdefault("env", []).extend(added["env"])
+    rec.setdefault("created", [])
+    rec["created"].extend(k for k in added["created"] if k not in rec["created"])
+    if added["statusLine"]:
+        rec["statusLine"] = added["statusLine"]
+    rec.setdefault("hooks", []).extend(added["hooks"])
+
+
+def unmerge_settings(rec):
+    real = rec.get("file")
+    if not real or not os.path.exists(real):
+        return
+    data, err = read_settings(real)
+    if err:
+        return fail(err)
+    for k in rec.get("env", []):
+        data.get("env", {}).pop(k, None)
+    if "env" in rec.get("created", []) and data.get("env") == {}:
+        del data["env"]
+    if rec.get("statusLine") and data.get("statusLine") == rec["statusLine"]:
+        del data["statusLine"]
+    for h in rec.get("hooks", []):
+        lst = data.get("hooks", {}).get(h["event"], [])
+        if h["entry"] in lst:
+            lst.remove(h["entry"])
+        if not lst:
+            data.get("hooks", {}).pop(h["event"], None)
+    if "hooks" in rec.get("created", []) and data.get("hooks") == {}:
+        del data["hooks"]
+    if not act(f"remove agent-kit entries from {real}"):
+        return
+    if rec.get("file_created") and not data:
+        os.unlink(real)
+    else:
+        write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+# ---------------------------------------------------------------- 7. plugins
+
+def claude_plugins(data):
+    exe = shutil.which("claude")
+    plugins = data.get("claude_plugins", [])
+    if not exe or not plugins:
+        return
+    r = run([exe, "plugin", "list"])
+    if r.returncode != 0:
+        return fail("claude plugin list failed: " + (r.stderr or r.stdout).strip())
+    for p in plugins:
+        spec = f"{p['plugin']}@{p['marketplace']}"
+        if spec in r.stdout:
+            continue
+        if not act(f"install claude plugin {spec}"):
+            continue
+        i = run([exe, "plugin", "install", spec, "--scope", "user"], kind="plugin")
+        if i.returncode != 0:
+            fail(f"claude plugin install {spec} failed: " + (i.stderr or i.stdout).strip())
+
+
+# ---------------------------------------------------------------- sync / install
+
+def step(name, fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:  # a failing step must not stop the others
+        fail(f"{name}: {e}")
+
+
+def do_sync(args):
+    kit, cache = kit_dir(), cache_dir()
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest = load_manifest()
+    if not getattr(args, "no_pull", False):
+        step("self-update", self_update, kit)
+    data, external, degraded = None, [], False
+    try:
+        data = load_sources(kit)
+    except (ValueError, OSError) as e:
+        fail(f"sources: {e}")
+    if data:
+        res = step("sources", sync_sources, data, cache)
+        external, degraded = res if res else ([], True)
+    else:
+        degraded = True
+    adopt = getattr(args, "adopt", False)
+    step("skills", link_skills, kit, external, manifest, adopt, stamp, degraded)
+    step("agents", link_agents, kit, manifest, adopt, stamp)
+    step("rules", sync_rules, kit, manifest)
+    step("settings", sync_settings, kit, manifest)
+    if data:
+        step("plugins", claude_plugins, data)
+    step("manifest", save_manifest, manifest)
+    return 1 if RUN["failed"] else 0
+
+
+def cron_line(kit):
+    log = state_dir() / "sync.log"
+    exe = shlex.quote(str(kit / "bin" / "agent-kit"))
+    return f"17 * * * * {exe} sync --quiet >> {shlex.quote(str(log))} 2>&1 {CRON_TAG}"
+
+
+def read_cron():
+    """The crontab text; None when there is no crontab program. A user with no
+    crontab yet is "", any other failure raises so nothing gets overwritten."""
+    exe = shutil.which("crontab")
+    if not exe:
+        return None
+    r = run([exe, "-l"])
+    if r.returncode == 0:
+        return r.stdout
+    if r.returncode == 1 and "no crontab for" in r.stderr.lower():
+        return ""
+    raise RuntimeError("crontab -l failed, crontab left alone: " + r.stderr.strip())
+
+
+def write_cron(text):
+    return run([shutil.which("crontab"), "-"], input=text)
+
+
+def install_timer(manifest):
+    line = cron_line(kit_dir())
+    cur = read_cron()
+    if cur is None:
+        return say("no crontab available; add this line yourself:\n  " + line)
+    if CRON_TAG in cur:
+        manifest["cron"] = True
+        return
+    if act("add cron line: " + line):
+        r = write_cron(cur + ("" if cur.endswith("\n") or not cur else "\n") + line + "\n")
+        if r.returncode != 0:
+            return fail("crontab write failed: " + r.stderr.strip())
+        manifest["cron"] = True
+
+
+def cmd_sync(args):
+    return do_sync(args)
+
+
+def cmd_install(args):
+    for d in (config_dir(), state_dir(), cache_dir()):
+        if not RUN["dry"]:
+            d.mkdir(parents=True, exist_ok=True)
+    do_sync(args)
+    if not args.no_timer:
+        manifest = load_manifest()
+        step("timer", install_timer, manifest)
+        step("manifest", save_manifest, manifest)
+    return 1 if RUN["failed"] else 0
+
+
+# ---------------------------------------------------------------- uninstall
+
+def read_manifest():
+    """(manifest, None) or (None, reason) when it is missing or unreadable."""
+    p = state_dir() / "manifest.json"
+    if not p.exists():
+        return None, f"no manifest at {p}; nothing was removed"
+    try:
+        m = json.loads(p.read_text())
+        if not isinstance(m, dict):
+            raise ValueError("not an object")
+    except ValueError as e:
+        return None, f"manifest {p} is unreadable ({e}); nothing was removed"
+    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("cron", False)):
+        m.setdefault(k, v)
+    return m, None
+
+
+def remove_cron_line():
+    cur = read_cron()
+    if cur is None:
+        return
+    kept = "".join(l for l in cur.splitlines(True) if CRON_TAG not in l)
+    if kept != cur and act("remove cron line"):
+        r = write_cron(kept)
+        if r.returncode != 0:
+            fail("crontab write failed: " + r.stderr.strip())
+
+
+def cmd_uninstall(args):
+    m, err = read_manifest()
+    if err:
+        if (state_dir() / "manifest.json").exists():
+            fail(err)
+            return 1
+        say(err)
+        return 0
+    roots = [kit_dir(), cache_dir()]
+    for path, target in sorted(m["links"].items()):
+        if not os.path.islink(path):
+            continue
+        cur = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        if cur == os.path.normpath(target) or inside(cur, roots):
+            if act(f"remove link {path}"):
+                os.unlink(path)
+        else:
+            say(f"left {path}: it no longer points where agent-kit put it")
+    for real in sorted(m["blocks"]):
+        cur = read_text_or_none(real)
+        if cur is None or (BEGIN not in cur and END not in cur):
+            continue
+        try:
+            check_markers(cur)
+        except ValueError as e:
+            fail(f"{real}: {e}")
+            continue
+        new = without_block(cur)
+        if not act(f"remove rules block from {real}"):
+            continue
+        if not new.strip() and m["blocks"][real].get("created"):
+            os.unlink(real)
+        else:
+            write_atomic(real, new)
+    if m["settings"]:
+        step("settings", unmerge_settings, m["settings"])
+    step("cron", remove_cron_line)
+    if not RUN["dry"] and not RUN["failed"]:
+        (state_dir() / "manifest.json").unlink(missing_ok=True)
+    say("left in place:")
+    for label, p in (("kit checkout", kit_dir()), ("config", config_dir()),
+                     ("cache", cache_dir()), ("state", state_dir()),
+                     ("backups", state_dir() / "backup")):
+        if p.exists():
+            say(f"  {label}: {p}")
+    return 1 if RUN["failed"] else 0
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(args):
+    kit, problems = kit_dir(), []
+
+    def out(msg):
+        print(msg)
+
+    def bad(msg):
+        problems.append(msg)
+        out("  PROBLEM " + msg)
+
+    out(f"kit: {kit} ({rev(kit) or 'not a git checkout'})")
+    t = tools()
+    out("tools: " + (", ".join(k for k, v in t.items() if v) or "none detected"))
+    external, data = [], None
+    try:
+        data = load_sources(kit)
+    except (ValueError, OSError) as e:
+        bad(f"sources: {e}")
+    provided = dict(kit_skills(kit))
+    for src in (data or {}).get("sources", []):
+        try:
+            d = source_dir(src["repo"], cache_dir())
+        except ValueError as e:
+            bad(str(e))
+            continue
+        for sk in src.get("skills", []):
+            sd = d / sk.get("path", ".") if sk.get("path", ".") != "." else d
+            if (sd / "SKILL.md").is_file():
+                provided.setdefault(sk["name"], sd)
+            else:
+                bad(f"skill {sk['name']}: not fetched ({src['repo']}); run sync")
+    out("skills:")
+    roots = [kit, cache_dir()]
+    for name, d in sorted(provided.items()):
+        states = [(lbl, plan_link(td / name, d, roots)) for lbl, td in skill_targets()]
+        if all(s == "ok" for _, s in states):
+            out(f"  ok {name}")
+        for lbl, s in states:
+            if s != "ok":
+                bad(f"skill {name} in {lbl}: {s if s != 'create' else 'not linked'}")
+    out("agents:")
+    if t["claude"]:
+        for f in sorted((kit / "adapters/claude-code/agents").glob("*.md")):
+            s = plan_link(Path.home() / ".claude/agents" / f.name, f, [kit])
+            out(f"  ok {f.name}") if s == "ok" else bad(f"agent {f.name}: {s}")
+    out("rules:")
+    for path, body in rules_targets(kit):
+        cur = read_text_or_none(os.path.realpath(path)) or ""
+        try:
+            check_markers(cur)
+        except ValueError as e:
+            bad(f"{path}: {e}")
+            continue
+        if with_block(cur, block(body)) == cur:
+            out(f"  ok {path} current")
+        elif BEGIN in cur:
+            bad(f"{path}: block stale")
+        else:
+            bad(f"{path}: block missing")
+    out("settings:")
+    frag = load_fragment(kit) if t["claude"] else None
+    if frag:
+        real = os.path.realpath(Path.home() / ".claude/settings.json")
+        sdata, err = read_settings(real)
+        if err:
+            bad(err)
+        else:
+            a = merge_settings(copy.deepcopy(sdata), frag)
+            missing = a["env"] + (["statusLine"] if a["statusLine"] else []) + \
+                [h["event"] + " hook" for h in a["hooks"]]
+            out("  ok settings") if not missing else bad("settings missing: " + ", ".join(missing))
+    out("plugins:")
+    exe = shutil.which("claude")
+    if data and data.get("claude_plugins") and exe:
+        listed = run([exe, "plugin", "list"]).stdout
+        for p in data["claude_plugins"]:
+            spec = f"{p['plugin']}@{p['marketplace']}"
+            out(f"  ok {spec}") if spec in listed else bad(f"plugin {spec} not installed")
+    else:
+        out("  none to check")
+    out("timer:")
+    try:
+        cur = read_cron()
+    except RuntimeError as e:
+        cur = None
+        bad(str(e))
+    if cur is None:
+        out("  crontab not available")
+    elif CRON_TAG in cur:
+        out("  ok cron line present")
+    else:
+        bad("timer: no cron line")
+    return 1 if problems else 0
+
+
+# ---------------------------------------------------------------- main
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+    p = argparse.ArgumentParser(prog="agent-kit", description=__doc__.split("\n")[0],
+                                parents=[common])
+    p.set_defaults(quiet=False, dry_run=False)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn, helptext in (("install", cmd_install, "sync, then install the hourly timer"),
+                               ("sync", cmd_sync, "update the kit and link everything"),
+                               ("doctor", cmd_doctor, "read-only health report"),
+                               ("uninstall", cmd_uninstall, "remove what the kit created")):
+        sp = sub.add_parser(name, help=helptext, parents=[common])
+        sp.set_defaults(fn=fn)
+        if name in ("install", "sync"):
+            sp.add_argument("--adopt", action="store_true",
+                            help="back up conflicting entries and link over them")
+            sp.add_argument("--no-pull", action="store_true", help="skip the self-update")
+        if name == "install":
+            sp.add_argument("--no-timer", action="store_true", help="do not add the cron line")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    RUN.update(quiet=args.quiet, dry=args.dry_run)
+    if args.cmd == "doctor":
+        RUN["dry"] = True          # read-only by construction
+        return args.fn(args)
+    lock = None
+    if not RUN["dry"]:
+        state_dir().mkdir(parents=True, exist_ok=True)
+        lock = open(state_dir() / "lock", "a")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say("another agent-kit run is in progress; skipped")
+            return 0
+        except OSError as e:
+            # A filesystem without locking must not turn every run into a silent no-op.
+            print(f"agent-kit: cannot lock {state_dir() / 'lock'}: {e}", file=sys.stderr)
+            return 1
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

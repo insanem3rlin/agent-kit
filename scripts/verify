@@ -1,0 +1,23 @@
+#!/bin/sh
+# The repository's single verify command: leak check, then the test suites.
+cd "$(dirname "$0")/.." || exit 2
+
+scripts/leak-check || exit $?
+
+if python3 -m pytest --version >/dev/null 2>&1; then
+    pytest_cmd="python3 -m pytest"
+elif [ -n "$AGENT_KIT_PYTEST" ]; then
+    pytest_cmd="$AGENT_KIT_PYTEST"
+else
+    echo "verify: no pytest found; install it or set AGENT_KIT_PYTEST to a pytest command" >&2
+    exit 1
+fi
+
+paths=""
+for p in tests hooks/tests skills/*/tests; do
+    [ -d "$p" ] && paths="$paths $p"
+done
+[ -z "$paths" ] && { echo "verify: no test directories found"; exit 0; }
+
+# shellcheck disable=SC2086
+exec $pytest_cmd $paths -q -p no:cacheprovider

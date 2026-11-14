@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Guard a public repository against private details.
+
+Scans every file git would publish (`git ls-files -co --exclude-standard`), or with
+--staged only the staged content. Two rule sets:
+
+  1. built-in patterns: secret-shaped strings, absolute home paths, email addresses;
+  2. a private blocklist from ${AGENT_KIT_CONFIG:-~/.config/agent-kit}/blocklist.txt
+     and/or the AGENT_KIT_BLOCKLIST environment variable (newline-separated).
+
+Exit codes: 0 clean, 1 findings, 2 usage or configuration error.
+Blocklist hits print the term's number only, never the term. Built-in hits print the rule
+name and at most 4 leading characters (none for home paths, emails, or lines that also hit
+the blocklist).
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+ALLOW_MARKER = "leak-check: allow"
+# Files that legitimately hold pattern definitions or deliberately fake fixtures.
+BUILTIN_ALLOWLIST = {"scripts/leak-check", "tests/test_leak_check.py"}
+SHOWN_CHARS = 4  # secret-shaped findings print at most this many leading characters
+NO_TEXT_RULES = {"home-path", "email"}
+
+HOME_PLACEHOLDERS = {"user", "username", "you", "name", "runner", "example"}
+EMAIL_LOCAL_OK = {"noreply", "no-reply", "git"}
+EMAIL_DOMAIN_OK = re.compile(r"^(example\.(com|org|net)|users\.noreply\.github\.com)$|\.(invalid|test|example|localhost)$", re.I)
+
+BUILTIN_RULES = [
+    ("private-key", re.compile(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY")),
+    ("openai-key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}")),
+    ("github-token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    (
+        "secret-assignment",
+        re.compile(r"""\b[A-Za-z0-9_]{0,64}(?:KEY|TOKEN|SECRET|PASSWORD)\s*[=:]\s*['"]?[A-Za-z0-9_\-+/=]{16,}""", re.I),
+    ),
+]
+HOME_RE = re.compile(r"/(?:home|Users)/([A-Za-z0-9._-]+)/")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b")
+
+
+class Config(Exception):
+    pass
+
+
+def git(root, *args, check=True):
+    r = subprocess.run(["git", *args], cwd=root, capture_output=True)
+    if check and r.returncode != 0:
+        raise Config("git %s failed: %s" % (args[0], r.stderr.decode("utf-8", "replace").strip()))
+    return r.stdout
+
+
+def repo_root():
+    try:
+        r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Config("git not found")
+    if r.returncode != 0:
+        raise Config("not inside a git repository")
+    return r.stdout.strip()
+
+
+def list_files(root, staged):
+    if staged:
+        out = git(root, "diff", "--cached", "--name-only", "--diff-filter=ACMR", "-z")
+    else:
+        out = git(root, "ls-files", "-co", "--exclude-standard", "-z")
+    return sorted({p for p in out.decode("utf-8", "surrogateescape").split("\0") if p})
+
+
+def read_file(root, path, staged):
+    if staged:
+        data = git(root, "show", ":" + path, check=False)
+    else:
+        full = os.path.join(root, path)
+        if os.path.islink(full) or not os.path.isfile(full):
+            return None
+        with open(full, "rb") as fh:
+            data = fh.read()
+    if b"\0" in data[:8000]:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+def load_blocklist():
+    """Return (terms, found). Each term is (number, kind, value)."""
+    raw = []
+    found = False
+    cfg = os.environ.get("AGENT_KIT_CONFIG") or os.path.join(os.path.expanduser("~"), ".config", "agent-kit")
+    path = os.path.join(cfg, "blocklist.txt")
+    if os.path.isfile(path):
+        found = True
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            raw.extend(fh.read().splitlines())
+    env = os.environ.get("AGENT_KIT_BLOCKLIST", "")
+    if env.strip():
+        found = True
+        raw.extend(env.splitlines())
+    terms = []
+    for line in raw:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        n = len(terms) + 1
+        if line.startswith("re:"):
+            try:
+                terms.append((n, "re", re.compile(line[3:], re.I)))
+            except re.error:
+                raise Config("blocklist term #%d is not a valid regex" % n)
+        else:
+            terms.append((n, "sub", line.lower()))
+    return terms, found
+
+
+def builtin_findings(line):
+    for rule, rx in BUILTIN_RULES:
+        m = rx.search(line)
+        if m:
+            yield rule, m.group(0)
+    for m in HOME_RE.finditer(line):
+        if m.group(1).lower() not in HOME_PLACEHOLDERS:
+            yield "home-path", m.group(0)
+    for m in EMAIL_RE.finditer(line):
+        local, _, domain = m.group(0).rpartition("@")
+        if local.lower() in EMAIL_LOCAL_OK or EMAIL_DOMAIN_OK.search(domain):
+            continue
+        yield "email", m.group(0)
+
+
+def scan(root, files, staged, terms):
+    findings = []
+    for path in files:
+        text = read_file(root, path, staged)
+        if text is None:
+            continue
+        builtin = path not in BUILTIN_ALLOWLIST
+        for no, line in enumerate(text.splitlines(), 1):
+            low = line.lower()
+            hits = [n for n, kind, val in terms if ((val in low) if kind == "sub" else val.search(line))]
+            if builtin and ALLOW_MARKER not in line:
+                for rule, shown in builtin_findings(line):
+                    # A line that also hits the blocklist prints no matched text at all.
+                    if hits or rule in NO_TEXT_RULES:
+                        findings.append("%s:%d: %s" % (path, no, rule))
+                    else:
+                        findings.append("%s:%d: %s: %s\u2026" % (path, no, rule, shown[:SHOWN_CHARS]))
+            for n in hits:
+                findings.append("%s:%d: blocklist term #%d" % (path, no, n))
+    return findings
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write("leak-check: %s\n" % message)
+        sys.exit(2)
+
+
+def main(argv):
+    p = Parser(prog="leak-check", description="Scan a repository for private details.")
+    p.add_argument("--staged", action="store_true", help="scan staged content only")
+    p.add_argument("--require-blocklist", action="store_true", help="exit 2 when no blocklist is configured")
+    args = p.parse_args(argv)
+    try:
+        root = repo_root()
+        terms, found = load_blocklist()
+        if not found:
+            if args.require_blocklist:
+                raise Config("blocklist not found (AGENT_KIT_CONFIG/blocklist.txt or AGENT_KIT_BLOCKLIST)")
+            sys.stderr.write("leak-check: blocklist not found; running built-in patterns only\n")
+        findings = scan(root, list_files(root, args.staged), args.staged, terms)
+    except Config as e:
+        sys.stderr.write("leak-check: %s\n" % e)
+        return 2
+    for f in findings:
+        print(f)
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

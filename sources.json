@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "repo": "https://github.com/alexander-posztos/dotfiles.git",
+      "ref": "main",
+      "skills": [
+        {"name": "to-html", "path": "claude-skills/to-html"},
+        {"name": "walkthrough", "path": "claude-skills/walkthrough"},
+        {"name": "simpler", "path": "claude-skills/simpler"},
+        {"name": "texten-at", "path": "claude-skills/texten-at"},
+        {"name": "close-the-loop", "path": "claude-skills/close-the-loop"},
+        {"name": "variants", "path": "claude-skills/variants"}
+      ]
+    },
+    {
+      "repo": "https://github.com/alexander-posztos/sketchloop.git",
+      "ref": "main",
+      "skills": [
+        {"name": "sketchloop", "path": "."}
+      ]
+    }
+  ],
+  "claude_plugins": [
+    {"plugin": "mattpocock-skills", "marketplace": "claude-plugins-official"}
+  ]
+}
