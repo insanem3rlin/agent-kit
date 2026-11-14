@@ -88,7 +88,8 @@ class Env:
     def run(self, *args, env=None):
         e = dict(os.environ, **GIT_ENV)
         e.update(
-            HOME=str(self.home), AGENT_KIT_HOME=str(self.kit),
+            # USERPROFILE: Path.home() reads it, not HOME, on Windows.
+            HOME=str(self.home), USERPROFILE=str(self.home), AGENT_KIT_HOME=str(self.kit),
             AGENT_KIT_CONFIG=str(self.config), AGENT_KIT_CACHE=str(self.cache),
             AGENT_KIT_STATE=str(self.state), AGENT_KIT_ALLOW_LOCAL_SOURCES="1", FAKE_STATE=str(self.fake),
             PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",

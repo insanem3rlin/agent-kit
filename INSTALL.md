@@ -6,8 +6,8 @@ You were asked to install agent-kit on this machine. Follow these steps in order
 
 Check these and stop with a clear message if one fails.
 
-1. The machine is macOS or Linux (on Windows, work inside WSL).
-2. `git --version` and `python3 --version` both succeed, and Python is 3.10 or newer.
+1. The machine is macOS, Linux or Windows. On Windows, run the PowerShell commands given under each step (`install.ps1`, `bin\agent-kit.ps1`) natively, not in WSL: the agent tools live in the Windows home, and WSL has its own. Symbolic links need Developer Mode on (Settings > System > For developers) or an elevated shell; the installer checks this.
+2. `git --version` succeeds and Python 3.10 or newer is installed (`python3 --version` on macOS and Linux; on Windows the installer finds it and skips the Microsoft Store stub, or takes `AGENT_KIT_PYTHON`). Stock macOS ships Python 3.9, so install a newer one there first (`brew install python`).
 3. At least one of `~/.claude`, `~/.hermes` or `~/.codex` exists. With none of them there is no tool to install into, so say that and stop.
 
 ## Steps
@@ -24,6 +24,10 @@ Check these and stop with a clear message if one fails.
    ~/.agent-kit/install.sh --dry-run
    ```
 
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File ~\.agent-kit\install.ps1 --dry-run   # Windows
+   ```
+
 3. Read the preview. Lines starting with `error: conflict:` name a skill or agent that already exists on this machine under a name the kit provides. The kit never overwrites those. Show the list of conflicts to the user and ask which they want.
 
    - Keep their own versions: run the install without `--adopt`. The conflicting names stay as they are and the install exits with code 1, which is expected in this case.
@@ -37,10 +41,18 @@ Check these and stop with a clear message if one fails.
    ~/.agent-kit/install.sh            # or: ~/.agent-kit/install.sh --adopt
    ```
 
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File ~\.agent-kit\install.ps1   # Windows; add --adopt as above
+   ```
+
 5. Verify.
 
    ```sh
    ~/.agent-kit/bin/agent-kit doctor
+   ```
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File ~\.agent-kit\bin\agent-kit.ps1 doctor   # Windows
    ```
 
    The install is done when `doctor` exits 0, or when its only complaints are the conflicts the user chose to keep.
@@ -52,7 +64,7 @@ Tell the user this list in your report, limited to the tools that were found.
 - Claude Code (`~/.claude`): skills linked into `~/.claude/skills`, the agents `researcher`, `implementer` and `reviewer` linked into `~/.claude/agents`, one import line in a marked block of `~/.claude/CLAUDE.md`, and three additions to `settings.json` where those keys are unset (a docs-lookup hook, a statusline, a model fallback for subagents). The `mattpocock-skills` plugin is installed when the `claude` command is available.
 - Hermes (`~/.hermes`): skills linked into `~/.hermes/skills`, and the rules text in a marked block at the end of `~/.hermes/SOUL.md`.
 - Codex (`~/.codex`): skills linked into `~/.agents/skills`, and the rules text in a marked block of `~/.codex/AGENTS.md`.
-- An hourly cron entry that pulls this repository, refreshes the external skills and re-links.
+- An hourly cron entry that pulls this repository, refreshes the external skills and re-links. On Windows this is the scheduled task `agent-kit-sync`, which logs to `~\.local\state\agent-kit\sync.log`.
 - State in `~/.config/agent-kit/`, `~/.cache/agent-kit/` and `~/.local/state/agent-kit/`.
 
 Permission modes, secrets and the session's model are left alone.
@@ -74,5 +86,7 @@ State which tools were found, what was linked for each, which conflicts existed 
 ```sh
 ~/.agent-kit/bin/agent-kit uninstall
 ```
+
+On Windows: `powershell -ExecutionPolicy Bypass -File ~\.agent-kit\bin\agent-kit.ps1 uninstall`.
 
 This removes exactly what the install added and leaves backups, configuration and the checkout in place.
