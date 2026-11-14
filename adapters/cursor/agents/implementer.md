@@ -1,5 +1,5 @@
 ---
-# Generated from adapters/claude-code/agents/implementer.md; tests/test_gemini_cursor.py keeps them equal.
+# Generated from adapters/claude-code/agents/implementer.md; tests/test_cursor.py keeps them equal.
 name: implementer
 description: Writes and changes code for one well-scoped task from a brief. Use for every implementation task that is delegated.
 model: inherit

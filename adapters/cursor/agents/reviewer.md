@@ -1,5 +1,5 @@
 ---
-# Generated from adapters/claude-code/agents/reviewer.md; tests/test_gemini_cursor.py keeps them equal.
+# Generated from adapters/claude-code/agents/reviewer.md; tests/test_cursor.py keeps them equal.
 name: reviewer
 description: Reviews a diff against the spec it was built from, in a fresh context. Use before a change reaches a shared branch, which means before the commit when working on that branch and before the merge of a branch or pull request.
 model: inherit

@@ -8,7 +8,7 @@ Check these and stop with a clear message if one fails.
 
 1. The machine is macOS, Linux or Windows. On Windows, run the PowerShell commands given under each step (`install.ps1`, `bin\agent-kit.ps1`) natively, not in WSL: the agent tools live in the Windows home, and WSL has its own. Symbolic links need Developer Mode on (Settings > System > For developers) or an elevated shell; the installer checks this.
 2. `git --version` succeeds and Python 3.10 or newer is installed (`python3 --version` on macOS and Linux; on Windows the installer finds it and skips the Microsoft Store stub, or takes `AGENT_KIT_PYTHON`). Stock macOS ships Python 3.9, so install a newer one there first (`brew install python`).
-3. At least one of `~/.claude`, `~/.hermes`, `~/.codex`, `~/.gemini` or `~/.cursor` exists. With none of them there is no tool to install into, so say that and stop.
+3. At least one of `~/.claude`, `~/.hermes`, `~/.codex` or `~/.cursor` exists. With none of them there is no tool to install into, so say that and stop.
 
 ## Steps
 
@@ -61,7 +61,7 @@ Check these and stop with a clear message if one fails.
 
    Read, for each tool that was found:
 
-   - Machine level: `~/.claude/CLAUDE.md`, `~/.claude/skills/`, `~/.claude/agents/` and the enabled plugins in `~/.claude/settings.json`; `~/.codex/AGENTS.md`, `~/.codex/skills/` and `~/.agents/skills/`; `~/.hermes/SOUL.md` and `~/.hermes/skills/`; `~/.gemini/GEMINI.md`, `~/.gemini/skills/` and `~/.gemini/agents/`; `~/.cursor/skills/`, `~/.cursor/agents/` and the User Rules the user pastes from Cursor's settings; and the rules files of any other agent tool the user names. Skip the kit's own marked blocks (`<!-- agent-kit:begin -->` to `<!-- agent-kit:end -->`) and the links the kit made.
+   - Machine level: `~/.claude/CLAUDE.md`, `~/.claude/skills/`, `~/.claude/agents/` and the enabled plugins in `~/.claude/settings.json`; `~/.codex/AGENTS.md`, `~/.codex/skills/` and `~/.agents/skills/`; `~/.hermes/SOUL.md` and `~/.hermes/skills/`; `~/.cursor/skills/`, `~/.cursor/agents/` and the User Rules the user pastes from Cursor's settings; and the rules files of any other agent tool the user names. Skip the kit's own marked blocks (`<!-- agent-kit:begin -->` to `<!-- agent-kit:end -->`) and the links the kit made.
    - Repository level: ask the user where their repositories are. In each one, read `AGENTS.md`, `CLAUDE.md`, `.claude/settings.json`, `.claude/skills/` and `.agents/skills/`, and run `git shortlog -sn --all` (it works in sh and PowerShell) to see everyone who ever committed there.
 
    Sort what you find against `~/.agent-kit/rules/AGENTS.md` and `~/.agent-kit/skills/`:
@@ -86,7 +86,6 @@ Tell the user this list in your report, limited to the tools that were found.
 - Claude Code (`~/.claude`): skills linked into `~/.claude/skills`, the agents `researcher`, `implementer` and `reviewer` linked into `~/.claude/agents`, one import line in a marked block of `~/.claude/CLAUDE.md`, and three additions to `settings.json` where those keys are unset (a docs-lookup hook, a statusline, a model fallback for subagents). The `mattpocock-skills` plugin is installed when the `claude` command is available.
 - Hermes (`~/.hermes`): skills linked into `~/.hermes/skills`, and the rules text in a marked block at the end of `~/.hermes/SOUL.md`.
 - Codex (`~/.codex`): skills linked into `~/.agents/skills`, the agents `researcher`, `implementer` and `reviewer` linked into `~/.codex/agents`, the rules text in a marked block of `~/.codex/AGENTS.md`, and the docs-lookup hook in `~/.codex/hooks.json`. Tell the user that Codex runs the hook only after they trust it with `/hooks`.
-- Gemini CLI (`~/.gemini`): skills linked into `~/.agents/skills`, the three agents linked into `~/.gemini/agents`, the rules text in a marked block of `~/.gemini/GEMINI.md`, and the docs-lookup hook in `~/.gemini/settings.json`.
 - Cursor (`~/.cursor`): skills linked into `~/.agents/skills` and the three agents linked into `~/.cursor/agents`. Cursor keeps its user rules in its settings only, so tell the user to paste `~/.agent-kit/rules/AGENTS.md` into Customize > Rules once. Cursor runs the Claude Code hooks itself when `~/.claude` exists.
 - An hourly cron entry that pulls this repository, refreshes the external skills and re-links. On Windows this is the scheduled task `agent-kit-sync`, which logs to `~\.local\state\agent-kit\sync.log`.
 - State in `~/.config/agent-kit/`, `~/.cache/agent-kit/` and `~/.local/state/agent-kit/`.
@@ -95,7 +94,7 @@ Permission modes, secrets and the session's model are left alone.
 
 ## Rules for you while installing
 
-- Run the commands above as written. Edit no file under `~/.claude`, `~/.hermes`, `~/.codex`, `~/.gemini` or `~/.cursor` by hand except for the step 6 removals, never inside the kit's marked blocks, and do not create the links yourself.
+- Run the commands above as written. Edit no file under `~/.claude`, `~/.hermes`, `~/.codex` or `~/.cursor` by hand except for the step 6 removals, never inside the kit's marked blocks, and do not create the links yourself.
 - Use `--adopt` only after the user chose it in step 3.
 - If a step fails, show the command and its output, and stop. Do not work around a failure by deleting or moving the user's files.
 - Leave the statusline's usage lookup off. It needs the user's login token, and only the user turns it on, in `~/.config/agent-kit/statusline.json` (the header of `~/.agent-kit/adapters/claude-code/statusline.py` describes the two keys).

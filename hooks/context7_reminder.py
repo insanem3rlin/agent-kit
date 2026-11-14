@@ -5,8 +5,8 @@ Enforces the AGENTS.md 'Documentation lookup' rule: when an edit introduces a
 third-party import, remind the agent to pull real docs via the context7 skill
 instead of writing an API from memory.
 
-Run as a script it is the after-edit hook of Claude Code, Codex (apply_patch)
-and Gemini CLI (AfterTool); Cursor runs it through its Claude Code hook import.
+Run as a script it is the after-edit hook of Claude Code and Codex (apply_patch);
+Cursor runs it through its Claude Code hook import.
 It reads the tool payload on stdin and returns the reminder as
 hookSpecificOutput.additionalContext.
 
@@ -260,7 +260,7 @@ def main() -> None:
 
     print(json.dumps({
         "hookSpecificOutput": {
-            "hookEventName": data.get("hook_event_name") or "PostToolUse",   # Gemini says AfterTool
+            "hookEventName": "PostToolUse",
             "additionalContext": REMINDER.format(libs=", ".join(fresh)),
         }
     }))

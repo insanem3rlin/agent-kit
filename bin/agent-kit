@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """agent-kit: link a shared set of agent rules, skills and hooks into every
-agent tool on this machine (Claude Code, Hermes, Codex, Gemini CLI, Cursor).
+agent tool on this machine (Claude Code, Hermes, Codex, Cursor).
 
 Subcommands: install, sync, doctor, uninstall. Standard library only.
 
@@ -93,9 +93,9 @@ def state_dir():
 def tools():
     h = Path.home()
     return {"claude": (h / ".claude").exists(), "hermes": (h / ".hermes").exists(),
-            "codex": (h / ".codex").exists(), "gemini": (h / ".gemini").exists(),
+            "codex": (h / ".codex").exists(),
             "cursor": (h / ".cursor").exists(),
-            "agents": any((h / d).exists() for d in (".agents", ".codex", ".gemini", ".cursor"))}
+            "agents": any((h / d).exists() for d in (".agents", ".codex", ".cursor"))}
 
 
 def skill_targets():
@@ -125,7 +125,6 @@ def load_manifest():
     m.setdefault("blocks", {})
     m.setdefault("settings", {})
     m.setdefault("codex_hooks", {})
-    m.setdefault("gemini_settings", {})
     m.setdefault("cron", False)
     return m
 
@@ -505,7 +504,6 @@ def agent_sets(kit):
     return [(lbl, sorted((kit / src).glob(pat)), h / dst) for lbl, on, src, pat, dst in (
         ("claude-agents", t["claude"], "adapters/claude-code/agents", "*.md", ".claude/agents"),
         ("codex-agents", t["codex"], "adapters/codex/agents", "*.toml", ".codex/agents"),
-        ("gemini-agents", t["gemini"], "adapters/gemini/agents", "*.md", ".gemini/agents"),
         ("cursor-agents", t["cursor"], "adapters/cursor/agents", "*.md", ".cursor/agents")) if on]
 
 
@@ -566,8 +564,6 @@ def rules_targets(kit):
             out.append((h / ".hermes/SOUL.md", rules.read_text(encoding="utf-8")))
         if t["codex"]:
             out.append((h / ".codex/AGENTS.md", rules.read_text(encoding="utf-8")))
-        if t["gemini"]:
-            out.append((h / ".gemini/GEMINI.md", rules.read_text(encoding="utf-8")))
     return out
 
 
@@ -696,8 +692,7 @@ def settings_targets(kit):
     h, t = Path.home(), tools()
     return [(load_fragment(kit, rel), os.path.realpath(h / dst), key) for on, rel, dst, key in (
         (t["claude"], "claude-code/settings.fragment.json", ".claude/settings.json", "settings"),
-        (t["codex"], "codex/hooks.fragment.json", ".codex/hooks.json", "codex_hooks"),
-        (t["gemini"], "gemini/settings.fragment.json", ".gemini/settings.json", "gemini_settings")) if on]
+        (t["codex"], "codex/hooks.fragment.json", ".codex/hooks.json", "codex_hooks")) if on]
 
 
 def sync_settings(kit, manifest):
@@ -937,7 +932,7 @@ def read_manifest():
             raise ValueError("not an object")
     except ValueError as e:
         return None, f"manifest {p} is unreadable ({e}); nothing was removed"
-    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("codex_hooks", {}), ("gemini_settings", {}), ("cron", False)):
+    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("codex_hooks", {}), ("cron", False)):
         m.setdefault(k, v)
     return m, None
 
@@ -991,7 +986,7 @@ def cmd_uninstall(args):
             os.unlink(real)
         else:
             write_atomic(real, new)
-    for key in ("settings", "codex_hooks", "gemini_settings"):
+    for key in ("settings", "codex_hooks"):
         if m[key]:
             step(key, unmerge_settings, m[key])
     step("cron", remove_cron_line, m)
