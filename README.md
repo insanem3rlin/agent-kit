@@ -5,9 +5,9 @@ One set of working rules, skills and roles for coding agents, installed once per
 ## What you get
 
 - **Rules.** [`rules/AGENTS.md`](rules/AGENTS.md): under 100 lines on verification, tests, scope, asking, approval, delegation, review and where knowledge is kept. It is loaded into every session of every tool.
-- **Roles with fixed model tiers.** A `researcher` on the cheap tier, an `implementer` on the standard tier, a `reviewer` on the strong tier. In Claude Code these are subagents pinned to `haiku`, `sonnet` and `opus`, so the model follows from the role and a delegate never inherits the session's model.
+- **Roles with fixed model tiers.** A `researcher` on the cheap tier, an `implementer` on the standard tier, a `reviewer` on the strong tier. In Claude Code these are subagents pinned to `haiku`, `sonnet` and `opus`, in Codex agents pinned to `gpt-6-luna`, `gpt-6.1-terra` and `gpt-6.1-sol`, so the model follows from the role and a delegate never inherits the session's model.
 - **Skills.** The kit's own skills in [`skills/`](skills), plus skills by other authors listed in [`sources.json`](sources.json), which are fetched from their own repositories on each sync and never copied here.
-- **Hooks.** Checks that back the rules. The Claude Code adapter wires them today.
+- **Hooks.** Checks that back the rules. The Claude Code and Codex adapters wire them.
 
 ## Install
 
@@ -41,7 +41,7 @@ The installer links the kit into each tool it finds and adds an hourly timer tha
 |---|---|---|---|---|
 | Claude Code | `~/.claude` | an import line in a marked block of `~/.claude/CLAUDE.md` | links in `~/.claude/skills` | the three agents in `~/.claude/agents`; hook, statusline and subagent-model fallback merged into `settings.json` where those keys are unset |
 | Hermes | `~/.hermes` | the rules text in a marked block of `~/.hermes/SOUL.md` | links in `~/.hermes/skills` | |
-| Codex | `~/.codex` | the rules text in a marked block of `~/.codex/AGENTS.md` | links in `~/.agents/skills` | |
+| Codex | `~/.codex` | the rules text in a marked block of `~/.codex/AGENTS.md` | links in `~/.agents/skills` | the three agents in `~/.codex/agents`; the docs-lookup hook in `~/.codex/hooks.json`, active once trusted with `/hooks` |
 
 Permission modes, secrets and the session model are never touched. Machine-local state is in `~/.config/agent-kit/`.
 

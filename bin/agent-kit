@@ -123,6 +123,7 @@ def load_manifest():
     m.setdefault("links", {})
     m.setdefault("blocks", {})
     m.setdefault("settings", {})
+    m.setdefault("codex_hooks", {})
     m.setdefault("cron", False)
     return m
 
@@ -496,14 +497,19 @@ def link_skills(kit, external, manifest, adopt, stamp, degraded=False):
     return provided
 
 
+def agent_sets(kit):
+    """(label, agent files, target directory) per tool that has role agents."""
+    h, t = Path.home(), tools()
+    return [(lbl, sorted((kit / src).glob(pat)), h / dst) for lbl, on, src, pat, dst in (
+        ("claude-agents", t["claude"], "adapters/claude-code/agents", "*.md", ".claude/agents"),
+        ("codex-agents", t["codex"], "adapters/codex/agents", "*.toml", ".codex/agents")) if on]
+
+
 def link_agents(kit, manifest, adopt, stamp):
-    if not tools()["claude"]:
-        return
-    src = sorted((kit / "adapters/claude-code/agents").glob("*.md"))
-    tdir = Path.home() / ".claude/agents"
-    for f in src:
-        link_one(tdir / f.name, f, "claude-agents", manifest, adopt, stamp, [kit])
-    prune_links(tdir, {f.name for f in src}, [kit / "adapters"], manifest)
+    for label, src, tdir in agent_sets(kit):
+        for f in src:
+            link_one(tdir / f.name, f, label, manifest, adopt, stamp, [kit])
+        prune_links(tdir, {f.name for f in src}, [kit / "adapters"], manifest)
 
 
 # ---------------------------------------------------------------- 5. rules
@@ -591,8 +597,8 @@ def sync_rules(kit, manifest):
 
 # ---------------------------------------------------------------- 6. settings
 
-def load_fragment(kit):
-    p = kit / "adapters/claude-code/settings.fragment.json"
+def load_fragment(kit, rel="claude-code/settings.fragment.json"):
+    p = kit / "adapters" / rel
     if not p.is_file():
         return None
     quoted = shlex.quote(cmd_path(kit))
@@ -679,13 +685,23 @@ def read_settings(real):
     return data, None
 
 
+def settings_targets(kit):
+    """(fragment, settings file, manifest key) per tool whose JSON settings the kit merges into."""
+    h, t = Path.home(), tools()
+    return [(load_fragment(kit, rel), os.path.realpath(h / dst), key) for on, rel, dst, key in (
+        (t["claude"], "claude-code/settings.fragment.json", ".claude/settings.json", "settings"),
+        (t["codex"], "codex/hooks.fragment.json", ".codex/hooks.json", "codex_hooks")) if on]
+
+
 def sync_settings(kit, manifest):
-    if not tools()["claude"]:
-        return
-    frag = load_fragment(kit)
-    if frag is None:
-        return say("settings skipped: no settings.fragment.json in the kit")
-    real = os.path.realpath(Path.home() / ".claude/settings.json")
+    for frag, real, key in settings_targets(kit):
+        if frag is None:
+            say(f"{real} skipped: no fragment for it in the kit")
+            continue
+        merge_into(frag, real, manifest[key])
+
+
+def merge_into(frag, real, rec):
     data, err = read_settings(real)
     if err:
         return fail(err)
@@ -703,7 +719,6 @@ def sync_settings(kit, manifest):
         shutil.copy2(real, bak)
     Path(real).parent.mkdir(parents=True, exist_ok=True)
     write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    rec = manifest["settings"]
     rec.setdefault("file", real)
     rec.setdefault("file_created", not existed)
     rec.setdefault("env", []).extend(added["env"])
@@ -915,7 +930,7 @@ def read_manifest():
             raise ValueError("not an object")
     except ValueError as e:
         return None, f"manifest {p} is unreadable ({e}); nothing was removed"
-    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("cron", False)):
+    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("codex_hooks", {}), ("cron", False)):
         m.setdefault(k, v)
     return m, None
 
@@ -969,8 +984,9 @@ def cmd_uninstall(args):
             os.unlink(real)
         else:
             write_atomic(real, new)
-    if m["settings"]:
-        step("settings", unmerge_settings, m["settings"])
+    for key in ("settings", "codex_hooks"):
+        if m[key]:
+            step(key, unmerge_settings, m[key])
     step("cron", remove_cron_line, m)
     if not RUN["dry"] and not RUN["failed"]:
         (state_dir() / "manifest.json").unlink(missing_ok=True)
@@ -1026,9 +1042,9 @@ def cmd_doctor(args):
             if s != "ok":
                 bad(f"skill {name} in {lbl}: {s if s != 'create' else 'not linked'}")
     out("agents:")
-    if t["claude"]:
-        for f in sorted((kit / "adapters/claude-code/agents").glob("*.md")):
-            s = plan_link(Path.home() / ".claude/agents" / f.name, f, [kit])
+    for _, src, tdir in agent_sets(kit):
+        for f in src:
+            s = plan_link(tdir / f.name, f, [kit])
             out(f"  ok {f.name}") if s == "ok" else bad(f"agent {f.name}: {s}")
     out("rules:")
     for path, body in rules_targets(kit):
@@ -1045,17 +1061,16 @@ def cmd_doctor(args):
         else:
             bad(f"{path}: block missing")
     out("settings:")
-    frag = load_fragment(kit) if t["claude"] else None
-    if frag:
-        real = os.path.realpath(Path.home() / ".claude/settings.json")
+    for frag, real, _ in settings_targets(kit):
+        if not frag:
+            continue
         sdata, err = read_settings(real)
         if err:
             bad(err)
-        else:
-            a = merge_settings(copy.deepcopy(sdata), frag)
-            missing = a["env"] + (["statusLine"] if a["statusLine"] else []) + \
-                [h["event"] + " hook" for h in a["hooks"]]
-            out("  ok settings") if not missing else bad("settings missing: " + ", ".join(missing))
+            continue
+        a = merge_settings(copy.deepcopy(sdata), frag)
+        missing = a["env"] + (["statusLine"] if a["statusLine"] else []) +             [h["event"] + " hook" for h in a["hooks"]]
+        out(f"  ok {real}") if not missing else bad(f"{real} missing: " + ", ".join(missing))
     out("plugins:")
     exe = shutil.which("claude")
     if data and data.get("claude_plugins") and exe:

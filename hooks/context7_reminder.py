@@ -147,22 +147,55 @@ def libs_from_edit(data: dict) -> set:
     if isinstance(extra, dict) and extra.get("status") not in (None, "", "ok"):
         return set()
 
+    cwd = data.get("cwd") or os.getcwd()
+    patch = tool_input.get("command")      # Codex apply_patch
+    if isinstance(patch, str) and "*** Begin Patch" in patch:
+        libs = set()
+        for path, text in patch_files(patch).items():
+            libs |= libs_in(path, text, cwd)
+        return libs
+
     file_path = (
         tool_input.get("file_path")        # Claude Code Edit/Write
         or tool_input.get("path")          # other tools' write_file / patch
         or tool_input.get("notebook_path")
         or ""
     )
-    if not file_path or is_test(str(file_path)):
-        return set()
+    return libs_in(str(file_path), added_lines(tool_input), cwd) if file_path else set()
 
-    suffix = Path(str(file_path)).suffix.lower()
+
+def libs_in(file_path: str, text: str, cwd: str) -> set:
+    if is_test(file_path):
+        return set()
+    suffix = Path(file_path).suffix.lower()
     if suffix not in PY_SUFFIXES | JS_SUFFIXES:
         return set()
+    path = Path(cwd) / file_path           # relative patch paths are relative to the session
+    roots = [path.parent, Path(cwd), Path(cwd) / "src"]
+    return extract(text, suffix, roots)
 
-    cwd = data.get("cwd") or os.getcwd()
-    roots = [Path(str(file_path)).parent, Path(cwd), Path(cwd) / "src"]
-    return extract(added_lines(tool_input), suffix, roots)
+
+PATCH_FILE = re.compile(r"^\*\*\* (?:Add|Update) File: (.+)$")
+
+
+def patch_files(patch: str) -> dict:
+    """{path: added lines} for an apply_patch envelope ("*** Add File: p" or
+    "*** Update File: p", then "+" lines)."""
+    files, cur, name = {}, None, None
+    for line in patch.splitlines():
+        m = PATCH_FILE.match(line)
+        if m:
+            name = m.group(1).strip()
+            cur = files.setdefault(name, [])
+        elif line.startswith("*** Move to: ") and cur is not None:
+            files.pop(name, None)
+            name = line[len("*** Move to: "):].strip()
+            cur = files.setdefault(name, cur)
+        elif line.startswith(("*** Delete File:", "*** End Patch")):
+            cur = None
+        elif cur is not None and line.startswith("+"):
+            cur.append(line[1:])
+    return {p: "\n".join(lines) for p, lines in files.items()}
 
 
 # --------------------------------------------------------------------------- claude code

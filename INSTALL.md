@@ -85,7 +85,7 @@ Tell the user this list in your report, limited to the tools that were found.
 
 - Claude Code (`~/.claude`): skills linked into `~/.claude/skills`, the agents `researcher`, `implementer` and `reviewer` linked into `~/.claude/agents`, one import line in a marked block of `~/.claude/CLAUDE.md`, and three additions to `settings.json` where those keys are unset (a docs-lookup hook, a statusline, a model fallback for subagents). The `mattpocock-skills` plugin is installed when the `claude` command is available.
 - Hermes (`~/.hermes`): skills linked into `~/.hermes/skills`, and the rules text in a marked block at the end of `~/.hermes/SOUL.md`.
-- Codex (`~/.codex`): skills linked into `~/.agents/skills`, and the rules text in a marked block of `~/.codex/AGENTS.md`.
+- Codex (`~/.codex`): skills linked into `~/.agents/skills`, the agents `researcher`, `implementer` and `reviewer` linked into `~/.codex/agents`, the rules text in a marked block of `~/.codex/AGENTS.md`, and the docs-lookup hook in `~/.codex/hooks.json`. Tell the user that Codex runs the hook only after they trust it with `/hooks`.
 - An hourly cron entry that pulls this repository, refreshes the external skills and re-links. On Windows this is the scheduled task `agent-kit-sync`, which logs to `~\.local\state\agent-kit\sync.log`.
 - State in `~/.config/agent-kit/`, `~/.cache/agent-kit/` and `~/.local/state/agent-kit/`.
 
