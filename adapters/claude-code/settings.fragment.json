@@ -9,7 +9,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 {KIT}/hooks/context7_reminder.py"
+            "command": "{PYTHON} {KIT}/hooks/context7_reminder.py"
           }
         ]
       }
@@ -17,6 +17,6 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "python3 {KIT}/adapters/claude-code/statusline.py"
+    "command": "{PYTHON} {KIT}/adapters/claude-code/statusline.py"
   }
 }

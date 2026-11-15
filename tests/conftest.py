@@ -58,6 +58,11 @@ class Env:
             p = self.bin / name
             p.write_text(body)
             p.chmod(0o755)
+        # Scheduled tasks are machine-wide: a fake answers "the task exists" and
+        # logs every call, so no test reaches the real Task Scheduler.
+        for name in ("schtasks", "powershell"):     # powershell sets the task's power options
+            (self.bin / f"{name}.cmd").write_text(
+                f'@echo %* >> "%FAKE_STATE%\\{name}.log"\r\n@exit /b 0\r\n')
         self._make_kit()
 
     def _make_kit(self):
@@ -88,7 +93,8 @@ class Env:
     def run(self, *args, env=None):
         e = dict(os.environ, **GIT_ENV)
         e.update(
-            HOME=str(self.home), AGENT_KIT_HOME=str(self.kit),
+            # USERPROFILE: Path.home() reads it, not HOME, on Windows.
+            HOME=str(self.home), USERPROFILE=str(self.home), AGENT_KIT_HOME=str(self.kit),
             AGENT_KIT_CONFIG=str(self.config), AGENT_KIT_CACHE=str(self.cache),
             AGENT_KIT_STATE=str(self.state), AGENT_KIT_ALLOW_LOCAL_SOURCES="1", FAKE_STATE=str(self.fake),
             PATH=f"{self.bin}{os.pathsep}{os.environ['PATH']}",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """agent-kit: link a shared set of agent rules, skills and hooks into every
-agent tool on this machine (Claude Code, Hermes, Codex).
+agent tool on this machine (Claude Code, Hermes, Codex, Cursor).
 
 Subcommands: install, sync, doctor, uninstall. Standard library only.
 
@@ -10,7 +10,7 @@ AGENT_KIT_CACHE, AGENT_KIT_STATE.
 import argparse
 import copy
 import datetime
-import fcntl
+import errno
 import json
 import os
 import re
@@ -22,9 +22,16 @@ import sys
 import tempfile
 from pathlib import Path
 
-BEGIN = "<!-- agent-kit:begin -->"
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
+BEGIN ="<!-- agent-kit:begin -->"
 END = "<!-- agent-kit:end -->"
 CRON_TAG = "# agent-kit"
+TASK_NAME = "agent-kit-sync"     # the Windows scheduled task that stands in for cron
 SOURCES_SCHEMA = 1
 RUN = {"quiet": False, "dry": False, "failed": False}
 
@@ -48,6 +55,18 @@ def act(msg):
 
 
 # ---------------------------------------------------------------- locations
+
+def cmd_path(p):
+    """A path as written into a command line or an @import: forward slashes on
+    Windows, so it works in Git Bash, cmd and Claude Code alike."""
+    return Path(p).as_posix() if WINDOWS else str(p)
+
+
+def python_cmd():
+    """The interpreter the hooks and statusline run with. `python3` on Windows
+    is usually the Microsoft Store stub, so name this interpreter instead."""
+    return cmd_path(sys.executable) if WINDOWS else "python3"
+
 
 def kit_dir():
     v = os.environ.get("AGENT_KIT_HOME")
@@ -75,7 +94,8 @@ def tools():
     h = Path.home()
     return {"claude": (h / ".claude").exists(), "hermes": (h / ".hermes").exists(),
             "codex": (h / ".codex").exists(),
-            "agents": (h / ".agents").exists() or (h / ".codex").exists()}
+            "cursor": (h / ".cursor").exists(),
+            "agents": any((h / d).exists() for d in (".agents", ".codex", ".cursor"))}
 
 
 def skill_targets():
@@ -98,12 +118,13 @@ def load_manifest():
     m = {}
     if p.exists():
         try:
-            m = json.loads(p.read_text())
+            m = json.loads(p.read_text(encoding="utf-8"))
         except ValueError:
             fail(f"{p} is not valid JSON; starting a fresh manifest")
     m.setdefault("links", {})
     m.setdefault("blocks", {})
     m.setdefault("settings", {})
+    m.setdefault("codex_hooks", {})
     m.setdefault("cron", False)
     return m
 
@@ -120,7 +141,9 @@ def write_atomic(path, text):
     path = Path(path)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="." + path.name + ".")
     try:
-        with os.fdopen(fd, "w") as f:
+        # Text is read with universal newlines; a file that had CRLF gets CRLF back.
+        crlf = path.is_file() and b"\r\n" in path.read_bytes()
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\r\n" if crlf else "") as f:
             f.write(text)
         if path.exists():
             shutil.copymode(path, tmp)
@@ -140,17 +163,26 @@ def run(cmd, kind="other", env=None, cwd=None, input=None):
     """subprocess.run with no stdin, a timeout and the whole process group killed
     on expiry. A timeout comes back as returncode 124 with the reason in stderr."""
     limit = float(os.environ.get("AGENT_KIT_TIMEOUT") or TIMEOUTS[kind])
+    # Windows has no process groups; CREATE_NO_WINDOW keeps the hourly task from
+    # flashing a console per git call.
+    extra = {"creationflags": subprocess.CREATE_NO_WINDOW} if WINDOWS else \
+        {"start_new_session": True}
     try:
-        p = subprocess.Popen(cmd, cwd=cwd, env=env, text=True, start_new_session=True,
+        p = subprocess.Popen(cmd, cwd=cwd, env=env, text=True, encoding="utf-8",
+                             errors="replace",
                              stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, **extra)
     except OSError as e:
         return subprocess.CompletedProcess(cmd, 127, "", str(e))
     try:
         out, err = p.communicate(input, timeout=limit)
     except subprocess.TimeoutExpired:
         try:
-            os.killpg(p.pid, signal.SIGKILL)
+            if WINDOWS:   # the whole tree, or a git-remote-https child keeps the pipes open
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                               capture_output=True, **extra)
+            else:
+                os.killpg(p.pid, signal.SIGKILL)
         except OSError:
             pass
         p.communicate()
@@ -197,7 +229,7 @@ def load_sources(kit):
     p = kit / "sources.json"
     if not p.exists():
         return {"sources": [], "claude_plugins": []}
-    data = json.loads(p.read_text())
+    data = json.loads(p.read_text(encoding="utf-8"))
     if data.get("schema") != SOURCES_SCHEMA:
         raise ValueError(f"{p}: unknown schema {data.get('schema')!r} (expected {SOURCES_SCHEMA})")
     return data
@@ -254,7 +286,19 @@ def remove_mirror(d, cache):
     if not owned_mirror(d):
         raise ValueError(f"refusing to remove {d}: not a mirror the kit cloned; "
                          "move it away by hand")
-    shutil.rmtree(d)
+    rmtree(d)
+
+
+def rmtree(d, ignore_errors=False):
+    """shutil.rmtree that also removes git's read-only object files on Windows."""
+    def retry(fn, path, _exc):
+        os.chmod(path, 0o700)
+        fn(path)
+    try:
+        shutil.rmtree(d, **{"onexc" if sys.version_info >= (3, 12) else "onerror": retry})
+    except OSError:
+        if not ignore_errors:
+            raise
 
 
 def fetch_source(src, cache):
@@ -301,7 +345,7 @@ def fetch_source(src, cache):
         return d, False
     finally:
         if tmp.exists():
-            shutil.rmtree(tmp, ignore_errors=True)
+            rmtree(tmp, ignore_errors=True)
     return d, True
 
 
@@ -361,13 +405,24 @@ def inside(p, roots):
     return False
 
 
+def link_target(path):
+    """Where a link points, made absolute. Windows reports `\\\\?\\C:\\...`; the
+    prefix is dropped so the path compares equal to the kit's own paths."""
+    t = os.readlink(path)
+    if WINDOWS and t.startswith("\\\\?\\UNC\\"):
+        t = "\\\\" + t[8:]
+    elif WINDOWS and t.startswith("\\\\?\\"):
+        t = t[4:]
+    return os.path.normpath(os.path.join(os.path.dirname(str(path)), t))
+
+
 def plan_link(path, target, roots):
     """One of: ok, create, repoint, conflict."""
     path = str(path)
     if os.path.islink(path):
         if os.path.realpath(path) == os.path.realpath(str(target)):
             return "ok"
-        cur = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        cur = link_target(path)
         return "repoint" if inside(cur, roots) else "conflict"
     return "conflict" if os.path.lexists(path) else "create"
 
@@ -375,12 +430,17 @@ def plan_link(path, target, roots):
 def make_link(path, target):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    is_dir = os.path.isdir(str(target))     # Windows needs to know; POSIX ignores it
     try:
-        os.symlink(str(target), str(path))
+        os.symlink(str(target), str(path), target_is_directory=is_dir)
     except FileExistsError:
         if not path.is_symlink():
             raise
         if os.path.realpath(path) == os.path.realpath(str(target)):
+            return
+        if WINDOWS:     # a directory link cannot be replaced over; re-point in two steps
+            os.unlink(str(path))
+            os.symlink(str(target), str(path), target_is_directory=is_dir)
             return
         tmp = path.with_name(f".{path.name}.agent-kit-{os.getpid()}")
         os.symlink(str(target), str(tmp))
@@ -415,7 +475,7 @@ def prune_links(directory, wanted, roots, manifest):
     for p in sorted(directory.iterdir()):
         if p.name in wanted or not p.is_symlink():
             continue
-        cur = os.path.normpath(os.path.join(str(directory), os.readlink(p)))
+        cur = link_target(p)
         if inside(cur, roots):
             if act(f"remove stale link {p}"):
                 p.unlink()
@@ -438,14 +498,20 @@ def link_skills(kit, external, manifest, adopt, stamp, degraded=False):
     return provided
 
 
+def agent_sets(kit):
+    """(label, agent files, target directory) per tool that has role agents."""
+    h, t = Path.home(), tools()
+    return [(lbl, sorted((kit / src).glob(pat)), h / dst) for lbl, on, src, pat, dst in (
+        ("claude-agents", t["claude"], "adapters/claude-code/agents", "*.md", ".claude/agents"),
+        ("codex-agents", t["codex"], "adapters/codex/agents", "*.toml", ".codex/agents"),
+        ("cursor-agents", t["cursor"], "adapters/cursor/agents", "*.md", ".cursor/agents")) if on]
+
+
 def link_agents(kit, manifest, adopt, stamp):
-    if not tools()["claude"]:
-        return
-    src = sorted((kit / "adapters/claude-code/agents").glob("*.md"))
-    tdir = Path.home() / ".claude/agents"
-    for f in src:
-        link_one(tdir / f.name, f, "claude-agents", manifest, adopt, stamp, [kit])
-    prune_links(tdir, {f.name for f in src}, [kit / "adapters"], manifest)
+    for label, src, tdir in agent_sets(kit):
+        for f in src:
+            link_one(tdir / f.name, f, label, manifest, adopt, stamp, [kit])
+        prune_links(tdir, {f.name for f in src}, [kit / "adapters"], manifest)
 
 
 # ---------------------------------------------------------------- 5. rules
@@ -492,18 +558,18 @@ def rules_targets(kit):
     rules = kit / "rules" / "AGENTS.md"
     out = []
     if t["claude"]:
-        out.append((h / ".claude/CLAUDE.md", f"@{rules}"))
+        out.append((h / ".claude/CLAUDE.md", f"@{cmd_path(rules)}"))
     if rules.is_file():
         if t["hermes"]:
-            out.append((h / ".hermes/SOUL.md", rules.read_text()))
+            out.append((h / ".hermes/SOUL.md", rules.read_text(encoding="utf-8")))
         if t["codex"]:
-            out.append((h / ".codex/AGENTS.md", rules.read_text()))
+            out.append((h / ".codex/AGENTS.md", rules.read_text(encoding="utf-8")))
     return out
 
 
 def read_text_or_none(p):
     try:
-        return Path(p).read_text()
+        return Path(p).read_text(encoding="utf-8-sig")   # PS 5.1 writes a BOM
     except FileNotFoundError:
         return None
 
@@ -533,21 +599,22 @@ def sync_rules(kit, manifest):
 
 # ---------------------------------------------------------------- 6. settings
 
-def load_fragment(kit):
-    p = kit / "adapters/claude-code/settings.fragment.json"
+def load_fragment(kit, rel="claude-code/settings.fragment.json"):
+    p = kit / "adapters" / rel
     if not p.is_file():
         return None
-    quoted = shlex.quote(str(kit))
+    quoted = shlex.quote(cmd_path(kit))
+    python = shlex.quote(python_cmd())
 
     def subst(o):
         if isinstance(o, str):
-            return o.replace("{KIT}", quoted)
+            return o.replace("{KIT}", quoted).replace("{PYTHON}", python)
         if isinstance(o, list):
             return [subst(x) for x in o]
         if isinstance(o, dict):
             return {k: subst(v) for k, v in o.items()}
         return o
-    return subst(json.loads(p.read_text()))
+    return subst(json.loads(p.read_text(encoding="utf-8")))
 
 
 def scripts_in(cmd):
@@ -620,13 +687,23 @@ def read_settings(real):
     return data, None
 
 
+def settings_targets(kit):
+    """(fragment, settings file, manifest key) per tool whose JSON settings the kit merges into."""
+    h, t = Path.home(), tools()
+    return [(load_fragment(kit, rel), os.path.realpath(h / dst), key) for on, rel, dst, key in (
+        (t["claude"], "claude-code/settings.fragment.json", ".claude/settings.json", "settings"),
+        (t["codex"], "codex/hooks.fragment.json", ".codex/hooks.json", "codex_hooks")) if on]
+
+
 def sync_settings(kit, manifest):
-    if not tools()["claude"]:
-        return
-    frag = load_fragment(kit)
-    if frag is None:
-        return say("settings skipped: no settings.fragment.json in the kit")
-    real = os.path.realpath(Path.home() / ".claude/settings.json")
+    for frag, real, key in settings_targets(kit):
+        if frag is None:
+            say(f"{real} skipped: no fragment for it in the kit")
+            continue
+        merge_into(frag, real, manifest[key])
+
+
+def merge_into(frag, real, rec):
     data, err = read_settings(real)
     if err:
         return fail(err)
@@ -644,7 +721,6 @@ def sync_settings(kit, manifest):
         shutil.copy2(real, bak)
     Path(real).parent.mkdir(parents=True, exist_ok=True)
     write_atomic(real, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
-    rec = manifest["settings"]
     rec.setdefault("file", real)
     rec.setdefault("file_created", not existed)
     rec.setdefault("env", []).extend(added["env"])
@@ -765,7 +841,54 @@ def write_cron(text):
     return run([shutil.which("crontab"), "-"], input=text)
 
 
+def task_command(kit):
+    """The scheduled task's command line. pythonw has no console window; --log
+    stands in for cron's shell redirection."""
+    py = Path(sys.executable)
+    exe = py.with_name("pythonw.exe") if py.with_name("pythonw.exe").exists() else py
+    return f'"{exe}" "{kit / "bin" / "agent-kit"}" sync --quiet --log'
+
+
+def task_exists():
+    """True/False for the scheduled task; None when there is no schtasks."""
+    exe = shutil.which("schtasks")
+    return None if not exe else run([exe, "/Query", "/TN", TASK_NAME]).returncode == 0
+
+
+def install_task(manifest):
+    cmd = task_command(kit_dir())
+    cur = task_exists()
+    if cur is None:
+        return say(f"no schtasks available; schedule this hourly yourself:\n  {cmd}")
+    if not cur:
+        if not act(f"add hourly scheduled task {TASK_NAME}: {cmd}"):
+            return
+        r = run([shutil.which("schtasks"), "/Create", "/F", "/SC", "HOURLY", "/ST", "00:17",
+                 "/TN", TASK_NAME, "/TR", cmd])
+        if r.returncode != 0:
+            return fail("schtasks /Create failed: " + (r.stderr or r.stdout).strip())
+    manifest["cron"] = True
+    # schtasks cannot say "run on battery" or "catch up a missed run"; cron has
+    # neither condition, so set both. Re-applied on every install.
+    if act(f"allow {TASK_NAME} on battery"):
+        r = run([shutil.which("powershell") or "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 f"Set-ScheduledTask -TaskName {TASK_NAME} -Settings (New-ScheduledTaskSettingsSet "
+                 "-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable) | Out-Null"])
+        if r.returncode != 0:
+            say(f"note: {TASK_NAME} keeps the default battery conditions: "
+                + (r.stderr or r.stdout).strip())
+
+
+def remove_task():
+    if task_exists() and act(f"remove scheduled task {TASK_NAME}"):
+        r = run([shutil.which("schtasks"), "/Delete", "/F", "/TN", TASK_NAME])
+        if r.returncode != 0:
+            fail("schtasks /Delete failed: " + (r.stderr or r.stdout).strip())
+
+
 def install_timer(manifest):
+    if WINDOWS:
+        return install_task(manifest)
     line = cron_line(kit_dir())
     cur = read_cron()
     if cur is None:
@@ -804,17 +927,21 @@ def read_manifest():
     if not p.exists():
         return None, f"no manifest at {p}; nothing was removed"
     try:
-        m = json.loads(p.read_text())
+        m = json.loads(p.read_text(encoding="utf-8"))
         if not isinstance(m, dict):
             raise ValueError("not an object")
     except ValueError as e:
         return None, f"manifest {p} is unreadable ({e}); nothing was removed"
-    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("cron", False)):
+    for k, v in (("links", {}), ("blocks", {}), ("settings", {}), ("codex_hooks", {}), ("cron", False)):
         m.setdefault(k, v)
     return m, None
 
 
-def remove_cron_line():
+def remove_cron_line(manifest):
+    if WINDOWS:
+        # A scheduled task is machine-wide, not per HOME or state directory, so
+        # only the install that recorded it may remove it.
+        return remove_task() if manifest.get("cron") else None
     cur = read_cron()
     if cur is None:
         return
@@ -837,7 +964,7 @@ def cmd_uninstall(args):
     for path, target in sorted(m["links"].items()):
         if not os.path.islink(path):
             continue
-        cur = os.path.normpath(os.path.join(os.path.dirname(path), os.readlink(path)))
+        cur = link_target(path)
         if cur == os.path.normpath(target) or inside(cur, roots):
             if act(f"remove link {path}"):
                 os.unlink(path)
@@ -859,9 +986,10 @@ def cmd_uninstall(args):
             os.unlink(real)
         else:
             write_atomic(real, new)
-    if m["settings"]:
-        step("settings", unmerge_settings, m["settings"])
-    step("cron", remove_cron_line)
+    for key in ("settings", "codex_hooks"):
+        if m[key]:
+            step(key, unmerge_settings, m[key])
+    step("cron", remove_cron_line, m)
     if not RUN["dry"] and not RUN["failed"]:
         (state_dir() / "manifest.json").unlink(missing_ok=True)
     say("left in place:")
@@ -916,9 +1044,9 @@ def cmd_doctor(args):
             if s != "ok":
                 bad(f"skill {name} in {lbl}: {s if s != 'create' else 'not linked'}")
     out("agents:")
-    if t["claude"]:
-        for f in sorted((kit / "adapters/claude-code/agents").glob("*.md")):
-            s = plan_link(Path.home() / ".claude/agents" / f.name, f, [kit])
+    for _, src, tdir in agent_sets(kit):
+        for f in src:
+            s = plan_link(tdir / f.name, f, [kit])
             out(f"  ok {f.name}") if s == "ok" else bad(f"agent {f.name}: {s}")
     out("rules:")
     for path, body in rules_targets(kit):
@@ -935,17 +1063,16 @@ def cmd_doctor(args):
         else:
             bad(f"{path}: block missing")
     out("settings:")
-    frag = load_fragment(kit) if t["claude"] else None
-    if frag:
-        real = os.path.realpath(Path.home() / ".claude/settings.json")
+    for frag, real, _ in settings_targets(kit):
+        if not frag:
+            continue
         sdata, err = read_settings(real)
         if err:
             bad(err)
-        else:
-            a = merge_settings(copy.deepcopy(sdata), frag)
-            missing = a["env"] + (["statusLine"] if a["statusLine"] else []) + \
-                [h["event"] + " hook" for h in a["hooks"]]
-            out("  ok settings") if not missing else bad("settings missing: " + ", ".join(missing))
+            continue
+        a = merge_settings(copy.deepcopy(sdata), frag)
+        missing = a["env"] + (["statusLine"] if a["statusLine"] else []) +             [h["event"] + " hook" for h in a["hooks"]]
+        out(f"  ok {real}") if not missing else bad(f"{real} missing: " + ", ".join(missing))
     out("plugins:")
     exe = shutil.which("claude")
     if data and data.get("claude_plugins") and exe:
@@ -956,6 +1083,15 @@ def cmd_doctor(args):
     else:
         out("  none to check")
     out("timer:")
+    if WINDOWS:
+        cur = task_exists()
+        if cur is None:
+            out("  schtasks not available")
+        elif cur:
+            out(f"  ok scheduled task {TASK_NAME} present")
+        else:
+            bad(f"timer: no scheduled task {TASK_NAME}")
+        return 1 if problems else 0
     try:
         cur = read_cron()
     except RuntimeError as e:
@@ -990,8 +1126,12 @@ def build_parser():
             sp.add_argument("--adopt", action="store_true",
                             help="back up conflicting entries and link over them")
             sp.add_argument("--no-pull", action="store_true", help="skip the self-update")
+        if name == "sync":
+            sp.add_argument("--log", action="store_true",
+                            help="append all output to sync.log in the state directory")
         if name == "install":
-            sp.add_argument("--no-timer", action="store_true", help="do not add the cron line")
+            sp.add_argument("--no-timer", action="store_true",
+                            help="do not add the timer (cron line, or scheduled task on Windows)")
     return p
 
 
@@ -1001,12 +1141,23 @@ def main(argv=None):
     if args.cmd == "doctor":
         RUN["dry"] = True          # read-only by construction
         return args.fn(args)
+    if getattr(args, "log", False):
+        state_dir().mkdir(parents=True, exist_ok=True)
+        sys.stdout = sys.stderr = open(state_dir() / "sync.log", "a", encoding="utf-8")
     lock = None
     if not RUN["dry"]:
         state_dir().mkdir(parents=True, exist_ok=True)
         lock = open(state_dir() / "lock", "a")
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if WINDOWS:     # EACCES/EDEADLOCK when another run holds byte 0
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError as e:
+                    if e.errno in (errno.EACCES, errno.EDEADLOCK):
+                        raise BlockingIOError(str(e)) from e
+                    raise
+            else:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             say("another agent-kit run is in progress; skipped")
             return 0
