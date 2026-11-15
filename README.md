@@ -5,7 +5,7 @@ One set of working rules, skills and roles for coding agents, installed once per
 ## What you get
 
 - **Rules.** [`rules/AGENTS.md`](rules/AGENTS.md): under 100 lines on verification, tests, scope, asking, approval, delegation, review and where knowledge is kept. It is loaded into every session of every tool.
-- **Roles with fixed model tiers.** A `researcher` on the cheap tier, an `implementer` on the standard tier, a `reviewer` on the strong tier. In Claude Code these are subagents pinned to `haiku`, `sonnet` and `opus`, in Codex agents pinned to `gpt-6-luna`, `gpt-6.1-terra` and `gpt-6.1-sol`, so the model follows from the role and a delegate never inherits the session's model.
+- **Roles with fixed model tiers.** A `researcher` on the cheap tier, an `implementer` on the standard tier, a `reviewer` on the strong tier. In Claude Code these are subagents pinned to `haiku`, `sonnet` and `opus`, in Codex agents pinned to `gpt-6-luna`, `gpt-6.1-terra` and `gpt-6.1-sol`, in Cursor to `composer-2.5-fast`, `grok-4.7-high-fast` and `claude-opus-5-5-medium`, so the model follows from the role and a delegate never inherits the session's model.
 - **Skills.** The kit's own skills in [`skills/`](skills), plus skills by other authors listed in [`sources.json`](sources.json), which are fetched from their own repositories on each sync and never copied here.
 - **Hooks.** Checks that back the rules. The Claude Code and Codex adapters wire them, and Cursor runs the Claude Code ones.
 

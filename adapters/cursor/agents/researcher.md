@@ -2,7 +2,7 @@
 # Generated from adapters/claude-code/agents/researcher.md; tests/test_cursor.py keeps them equal.
 name: researcher
 description: Read-only lookups and searches in code, docs and the web. Use for any question answered by finding and reading.
-model: inherit
+model: composer-2.5-fast
 readonly: true
 ---
 
