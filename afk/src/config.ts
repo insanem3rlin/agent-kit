@@ -10,9 +10,10 @@
 // fields below stay required.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { AGENTS } from "./backlog/types.ts";
 
 export const BACKLOG_KINDS = ["github", "backlog-md"] as const;
-export const AGENTS = ["claude", "codex", "cursor"] as const;
+export { AGENTS };
 
 export type BacklogKind = (typeof BACKLOG_KINDS)[number];
 export type AgentName = (typeof AGENTS)[number];
