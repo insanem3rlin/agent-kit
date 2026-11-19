@@ -110,7 +110,7 @@ test("sandcastle's own git setup (user, safe.directory) is not tampering", async
   const ports = createGitPorts();
   const snap = await ports.snapshot(f.wt);
   git(f.work, "config", "user.name", "Agent");
-  git(f.work, "config", "--add", "safe.directory", "/home/agent/workspace");
+  git(f.work, "config", "--add", "safe.directory", "/srv/workspace");
   assert.equal(await ports.restoreIfTampered(f.wt, snap), false);
 });
 
