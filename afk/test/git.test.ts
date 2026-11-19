@@ -26,10 +26,10 @@ function repo(branch: string): string {
 test("isGithubUrl accepts the https, ssh and scp forms of github.com", () => {
   for (const url of [
     "https://github.com/o/r.git",
-    "https://user@github.com/o/r",
+    "https://user@github.com/o/r", // leak-check: allow
     "http://github.com/o/r",
-    "git@github.com:o/r.git",
-    "ssh://git@github.com/o/r.git",
+    "git@github.com:o/r.git", // leak-check: allow
+    "ssh://git@github.com/o/r.git", // leak-check: allow
     "git://github.com/o/r.git",
   ]) {
     assert.equal(isGithubUrl(url), true, url);
@@ -39,10 +39,10 @@ test("isGithubUrl accepts the https, ssh and scp forms of github.com", () => {
 test("isGithubUrl rejects other hosts, lookalikes and local paths", () => {
   for (const url of [
     "https://gitlab.com/o/r.git",
-    "git@gitlab.com:o/r.git",
+    "git@gitlab.com:o/r.git", // leak-check: allow
     "https://github.com.evil.example/o/r",
     "https://example.com/github.com/o/r",
-    "git@notgithub.com:o/r.git",
+    "git@notgithub.com:o/r.git", // leak-check: allow
     "/srv/git/r.git",
     "",
   ]) {
@@ -53,7 +53,7 @@ test("isGithubUrl rejects other hosts, lookalikes and local paths", () => {
 test("originOnGithub reads the origin remote, and is false without one", () => {
   const dir = repo("main");
   assert.equal(originOnGithub(dir), false);
-  git(dir, "remote", "add", "origin", "git@github.com:o/r.git");
+  git(dir, "remote", "add", "origin", "git@github.com:o/r.git"); // leak-check: allow
   assert.equal(originOnGithub(dir), true);
   git(dir, "remote", "set-url", "origin", "https://gitlab.com/o/r.git");
   assert.equal(originOnGithub(dir), false);
