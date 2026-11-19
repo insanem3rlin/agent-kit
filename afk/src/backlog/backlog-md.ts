@@ -64,7 +64,10 @@ export const defaultGit: Git = (args, options) =>
     // A timed-out git is killed, but on Windows its helpers (git-remote-https)
     // keep the pipes open, so "close" may never come. Settle on the kill itself.
     child.on("exit", (_code, signal) => {
-      if (signal) reject(new Error(`git ${args.slice(0, 2).join(" ")} was killed (${signal}): ${err.trim()}`));
+      if (!signal) return;
+      child.stdout.destroy();
+      child.stderr.destroy();
+      reject(new Error(`git ${args.slice(0, 2).join(" ")} was killed (${signal}): ${err.trim()}`));
     });
     child.on("close", (code) => {
       if (code === 0) return resolve(out);
@@ -321,7 +324,7 @@ export function createBacklogMdBacklog(options: BacklogMdBacklogOptions): Backlo
    */
   async function finalStatus(): Promise<string> {
     const candidates = ["backlog.config.yml", `${dir}/config.yml`];
-    const names = (await run(["ls-tree", "-z", "--name-only", BASE_REF, "--", ...candidates], repoDir)).split(" ");
+    const names = (await run(["ls-tree", "-z", "--name-only", BASE_REF, "--", ...candidates], repoDir)).split("\0");
     const file = candidates.find((c) => names.includes(c));
     if (!file) return "done";
     let statuses: string[] | undefined;
