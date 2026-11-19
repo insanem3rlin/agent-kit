@@ -2,7 +2,7 @@
 """agent-kit: link a shared set of agent rules, skills and hooks into every
 agent tool on this machine (Claude Code, Hermes, Codex, Cursor).
 
-Subcommands: install, sync, doctor, uninstall. Standard library only.
+Subcommands: install, sync, doctor, uninstall, afk. Standard library only.
 
 Locations (all overridable for tests): AGENT_KIT_HOME, HOME, AGENT_KIT_CONFIG,
 AGENT_KIT_CACHE, AGENT_KIT_STATE.
@@ -31,6 +31,7 @@ else:
 BEGIN ="<!-- agent-kit:begin -->"
 END = "<!-- agent-kit:end -->"
 CRON_TAG = "# agent-kit"
+NODE_MIN = (22, 18)              # the AFK engine runs TypeScript directly
 TASK_NAME = "agent-kit-sync"     # the Windows scheduled task that stands in for cron
 SOURCES_SCHEMA = 1
 RUN = {"quiet": False, "dry": False, "failed": False}
@@ -1082,6 +1083,12 @@ def cmd_doctor(args):
             out(f"  ok {spec}") if spec in listed else bad(f"plugin {spec} not installed")
     else:
         out("  none to check")
+    out("afk:")
+    node, docker = tool_version("node"), tool_version("docker")
+    out(f"  node: {node} (needs {'.'.join(map(str, NODE_MIN))}+)" if node_ok(node)
+        else f"  node: {node} is too old, afk needs {'.'.join(map(str, NODE_MIN))}+" if node
+        else "  node: not found (only needed for afk)")
+    out(f"  docker: {docker}" if docker else "  docker: not found (only needed for afk)")
     out("timer:")
     if WINDOWS:
         cur = task_exists()
@@ -1106,6 +1113,53 @@ def cmd_doctor(args):
     return 1 if problems else 0
 
 
+# ---------------------------------------------------------------- afk
+
+def tool_version(name, flag="--version"):
+    """The first line of `<name> <flag>`, or None when the tool is missing or broken."""
+    exe = shutil.which(name)
+    if not exe:
+        return None
+    try:
+        r = subprocess.run([exe, flag], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = (r.stdout or r.stderr).strip().splitlines()
+    return lines[0] if r.returncode == 0 and lines else None
+
+
+def node_ok(version):
+    m = re.match(r"v?(\d+)\.(\d+)", version or "")
+    return bool(m) and (int(m[1]), int(m[2])) >= NODE_MIN
+
+
+def cmd_afk(args):
+    """Run the AFK engine (afk/ in the kit) in the current directory, in the foreground."""
+    afk = kit_dir() / "afk"
+    if not (afk / "src" / "main.ts").is_file():
+        print(f"agent-kit afk: engine not found at {afk}", file=sys.stderr)
+        return 1
+    need = ".".join(map(str, NODE_MIN))
+    if not node_ok(tool_version("node")):
+        print(f"agent-kit afk: Node {need} or newer is required (https://nodejs.org).",
+              file=sys.stderr)
+        return 1
+    if not (afk / "node_modules").is_dir():
+        npm = shutil.which("npm")
+        if not npm:
+            print("agent-kit afk: npm is required to install the engine.", file=sys.stderr)
+            return 1
+        say("installing the AFK engine (npm ci)")
+        if subprocess.run([npm, "ci"], cwd=afk).returncode != 0:
+            print("agent-kit afk: npm ci failed", file=sys.stderr)
+            return 1
+    try:
+        return subprocess.run([shutil.which("node"), str(afk / "src" / "main.ts"),
+                               *args.afk_args]).returncode
+    except KeyboardInterrupt:
+        return 130
+
+
 # ---------------------------------------------------------------- main
 
 def build_parser():
@@ -1119,7 +1173,8 @@ def build_parser():
     for name, fn, helptext in (("install", cmd_install, "sync, then install the hourly timer"),
                                ("sync", cmd_sync, "update the kit and link everything"),
                                ("doctor", cmd_doctor, "read-only health report"),
-                               ("uninstall", cmd_uninstall, "remove what the kit created")):
+                               ("uninstall", cmd_uninstall, "remove what the kit created"),
+                               ("afk", cmd_afk, "run the AFK daemon in this repository")):
         sp = sub.add_parser(name, help=helptext, parents=[common])
         sp.set_defaults(fn=fn)
         if name in ("install", "sync"):
@@ -1136,6 +1191,9 @@ def build_parser():
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["afk"]:        # long-running, and every argument belongs to the engine
+        return cmd_afk(argparse.Namespace(afk_args=argv[1:]))
     args = build_parser().parse_args(argv)
     RUN.update(quiet=args.quiet, dry=args.dry_run)
     if args.cmd == "doctor":

@@ -20,4 +20,13 @@ done
 [ -z "$paths" ] && { echo "verify: no test directories found"; exit 0; }
 
 # shellcheck disable=SC2086
-exec $pytest_cmd $paths -q -p no:cacheprovider
+$pytest_cmd $paths -q -p no:cacheprovider
+status=$?
+
+# The AFK engine's tests need only Node (22.18+ runs TypeScript directly).
+if command -v node >/dev/null 2>&1; then
+    (cd afk && node --test "test/*.test.ts") || status=1
+else
+    echo "verify: node not found; skipping the afk engine tests"
+fi
+exit $status

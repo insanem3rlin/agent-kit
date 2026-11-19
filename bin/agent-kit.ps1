@@ -1,6 +1,6 @@
 # Windows entry point for bin/agent-kit: finds a Python 3.10+ that is not the
 # Microsoft Store stub and runs agent-kit with it.
-# Usage: agent-kit.ps1 <install|sync|doctor|uninstall> [options]
+# Usage: agent-kit.ps1 <install|sync|doctor|uninstall|afk> [options]
 # No $ErrorActionPreference = 'Stop': under Windows PowerShell 5.1 it turns any
 # stderr line of a native command into a terminating error. Exit codes are checked.
 
