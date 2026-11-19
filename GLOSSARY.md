@@ -29,7 +29,7 @@ The state of an issue whose AFK run has finished, shown by the `ready-for-human`
 _Avoid_: Done, closed
 
 **AFK blocked**:
-The state of an issue whose AFK run ended without pushing a branch, shown by the `afk-blocked` label and a comment giving the reason; swapping it back to the AFK label retries it.
+The state of an issue whose AFK run ended having pushed no work, shown by the `afk-blocked` label and a comment giving the reason. For a GitHub issue no branch exists, and swapping the label back to the AFK label retries it. For a Backlog.md task the run pushes `afk/<id>` holding only the commit that swaps the label and records the reason; that branch is the claim, so a human deletes it to retry (see docs/adr/0003).
 _Avoid_: Failed, stuck
 
 **Backlog**:

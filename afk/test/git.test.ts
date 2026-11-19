@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { detectBaseBranch, isGithubUrl, originOnGithub, repoRoot } from "../src/git.ts";
+import { detectBaseBranch, isGithubUrl, originOnGithub, remoteGitOptions, repoRoot } from "../src/git.ts";
 
 const identity = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
 
@@ -93,4 +93,29 @@ test("without a remote, detectBaseBranch prefers main, then master, never the cu
 
   const neither = repo("feature/x");
   assert.equal(detectBaseBranch(neither), "main");
+});
+
+test("remoteGitOptions disables prompts, sets a timeout and keeps the user's own ssh command", () => {
+  const dir = mkdtempSync(join(tmpdir(), "afk-git-opts-"));
+  execFileSync("git", ["init", "-q"], { cwd: dir });
+  const saved = { c: process.env.GIT_SSH_COMMAND, s: process.env.GIT_SSH };
+  delete process.env.GIT_SSH_COMMAND;
+  delete process.env.GIT_SSH;
+  try {
+    const o = remoteGitOptions(dir);
+    assert.equal(o.env.GIT_TERMINAL_PROMPT, "0");
+    assert.equal(o.env.GCM_INTERACTIVE, "never");
+    assert.equal(o.env.GIT_SSH_COMMAND, "ssh -o BatchMode=yes");
+    assert.ok(o.timeout > 0);
+    execFileSync("git", ["config", "core.sshCommand", "my-ssh"], { cwd: dir });
+    assert.equal(remoteGitOptions(dir).env.GIT_SSH_COMMAND, undefined);
+    execFileSync("git", ["config", "--unset", "core.sshCommand"], { cwd: dir });
+    process.env.GIT_SSH_COMMAND = "own ssh";
+    assert.equal(remoteGitOptions(dir).env.GIT_SSH_COMMAND, "own ssh");
+  } finally {
+    if (saved.c === undefined) delete process.env.GIT_SSH_COMMAND;
+    else process.env.GIT_SSH_COMMAND = saved.c;
+    if (saved.s === undefined) delete process.env.GIT_SSH;
+    else process.env.GIT_SSH = saved.s;
+  }
 });

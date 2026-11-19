@@ -11,27 +11,34 @@ function git(cwd: string, ...args: string[]): string | null {
 }
 
 /**
- * Like git(), for a command that talks to the remote: it never prompts (no
- * terminal prompt, no SSH host-key or passphrase question, no credential
- * manager window) and gives up after a timeout, so `afk init` cannot hang.
+ * Spawn options for a git command that talks to the remote: it never prompts
+ * (no terminal prompt, no SSH host-key or passphrase question, no credential
+ * manager window) and gives up after a timeout, so it cannot hang.
  */
-function gitRemote(cwd: string, ...args: string[]): string | null {
+export function remoteGitOptions(cwd: string): { timeout: number; env: NodeJS.ProcessEnv } {
   // BatchMode only where the user has not chosen an ssh command of their own
   // (GIT_SSH_COMMAND overrides GIT_SSH and core.sshCommand, so setting it blindly
   // would swap out their ssh and key).
   const ownSsh = process.env.GIT_SSH_COMMAND || process.env.GIT_SSH || git(cwd, "config", "core.sshCommand");
+  return {
+    timeout: 15_000,
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: "0",
+      GCM_INTERACTIVE: "never",
+      ...(ownSsh ? {} : { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" }),
+    },
+  };
+}
+
+/** Like git(), for a command that talks to the remote, with remoteGitOptions(). */
+function gitRemote(cwd: string, ...args: string[]): string | null {
   try {
     return execFileSync("git", args, {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
-      timeout: 15_000,
-      env: {
-        ...process.env,
-        GIT_TERMINAL_PROMPT: "0",
-        GCM_INTERACTIVE: "never",
-        ...(ownSsh ? {} : { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" }),
-      },
+      ...remoteGitOptions(cwd),
     }).trim();
   } catch {
     return null;
