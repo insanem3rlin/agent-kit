@@ -1159,6 +1159,14 @@ def wait_through_interrupt(proc):
             interrupted = True
 
 
+def afk_exit_code(code, interrupted):
+    """The shell's convention: a child killed by signal N exits 128+N, and an
+    interrupted run that still exited 0 reports 130 (Ctrl+C)."""
+    if code < 0:
+        return 128 - code
+    return (code or 130) if interrupted else code
+
+
 def cmd_afk(args):
     """Run the AFK engine (afk/ in the kit) in the current directory, in the foreground."""
     afk = kit_dir() / "afk"
@@ -1189,7 +1197,7 @@ def cmd_afk(args):
     proc = subprocess.Popen([shutil.which("node"), str(afk / "src" / "main.ts"),
                              *args.afk_args])
     code, interrupted = wait_through_interrupt(proc)
-    return (code or 130) if interrupted else code
+    return afk_exit_code(code, interrupted)
 
 
 # ---------------------------------------------------------------- main
@@ -1228,6 +1236,10 @@ def main(argv=None):
     while argv[i:i + 1] and argv[i] in ("--quiet", "--dry-run"):
         i += 1
     if argv[i:i + 1] == ["afk"]:   # long-running, and every argument after it belongs to the engine
+        if "--dry-run" in argv[:i]:
+            print("agent-kit afk: --dry-run is not supported; the AFK daemon has no dry run",
+                  file=sys.stderr)
+            return 2
         RUN.update(quiet="--quiet" in argv[:i])
         return cmd_afk(argparse.Namespace(afk_args=argv[i + 1:]))
     args = build_parser().parse_args(argv)

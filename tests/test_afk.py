@@ -72,12 +72,28 @@ def test_afk_passes_the_engine_exit_code_through(env):
 
 
 @needs_node
-@pytest.mark.parametrize("flags", [["--quiet"], ["--dry-run"], ["--quiet", "--dry-run"]])
-def test_afk_works_after_global_flags(env, flags):
-    r = with_engine(env).run(*flags, "afk", "--help")
+def test_afk_works_after_a_global_quiet_flag(env):
+    r = with_engine(env).run("--quiet", "afk", "--help")
     assert r.returncode == 0, r.stderr
     assert "Run the AFK daemon in the current repository" in r.stdout
     assert not (env.state / "lock").exists()
+
+
+@pytest.mark.parametrize("flags", [["--dry-run"], ["--quiet", "--dry-run"]])
+def test_afk_refuses_dry_run_instead_of_running_for_real(env, flags):
+    fake_npm(with_engine(env, installed=False))
+    r = env.run(*flags, "afk")
+    assert r.returncode == 2
+    assert "--dry-run" in r.stderr
+    assert npm_calls(env) == []
+
+
+@pytest.mark.parametrize("code, interrupted, expected", [
+    (3, False, 3), (0, False, 0), (0, True, 130), (3, True, 3),
+    (-2, True, 130), (-15, False, 143),
+])
+def test_afk_exit_code_maps_signal_deaths_to_shell_codes(code, interrupted, expected):
+    assert load_cli().afk_exit_code(code, interrupted) == expected
 
 
 @needs_node
