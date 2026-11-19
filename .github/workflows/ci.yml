@@ -18,6 +18,8 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
+      - run: npm ci
+        working-directory: afk
       - run: pip install pytest
       - name: Verify
         env:

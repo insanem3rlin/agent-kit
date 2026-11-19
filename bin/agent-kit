@@ -11,6 +11,7 @@ import argparse
 import copy
 import datetime
 import errno
+import hashlib
 import json
 import os
 import re
@@ -1133,6 +1134,31 @@ def node_ok(version):
     return bool(m) and (int(m[1]), int(m[2])) >= NODE_MIN
 
 
+def afk_stamp(afk):
+    """What node_modules must record to count as installed from the current lockfile."""
+    return hashlib.sha256((afk / "package-lock.json").read_bytes()).hexdigest()
+
+
+def afk_needs_install(afk):
+    """True when node_modules is missing, partial (npm ci did not finish) or was
+    installed from a different lockfile. The stamp is written only after npm ci succeeds."""
+    try:
+        return (afk / "node_modules" / ".agent-kit-stamp").read_text().strip() != afk_stamp(afk)
+    except OSError:
+        return True
+
+
+def wait_through_interrupt(proc):
+    """Wait for a child that got Ctrl+C from the terminal too, so it can shut down
+    cleanly. Returns (exit code, whether Ctrl+C arrived)."""
+    interrupted = False
+    while True:
+        try:
+            return proc.wait(), interrupted
+        except KeyboardInterrupt:
+            interrupted = True
+
+
 def cmd_afk(args):
     """Run the AFK engine (afk/ in the kit) in the current directory, in the foreground."""
     afk = kit_dir() / "afk"
@@ -1144,20 +1170,26 @@ def cmd_afk(args):
         print(f"agent-kit afk: Node {need} or newer is required (https://nodejs.org).",
               file=sys.stderr)
         return 1
-    if not (afk / "node_modules").is_dir():
+    if afk_needs_install(afk):
         npm = shutil.which("npm")
         if not npm:
             print("agent-kit afk: npm is required to install the engine.", file=sys.stderr)
             return 1
         say("installing the AFK engine (npm ci)")
-        if subprocess.run([npm, "ci"], cwd=afk).returncode != 0:
+        try:
+            ok = subprocess.run([npm, "ci"], cwd=afk).returncode == 0
+        except KeyboardInterrupt:
+            print("agent-kit afk: interrupted during npm ci; run again to finish",
+                  file=sys.stderr)
+            return 130
+        if not ok:
             print("agent-kit afk: npm ci failed", file=sys.stderr)
             return 1
-    try:
-        return subprocess.run([shutil.which("node"), str(afk / "src" / "main.ts"),
-                               *args.afk_args]).returncode
-    except KeyboardInterrupt:
-        return 130
+        (afk / "node_modules" / ".agent-kit-stamp").write_text(afk_stamp(afk) + "\n")
+    proc = subprocess.Popen([shutil.which("node"), str(afk / "src" / "main.ts"),
+                             *args.afk_args])
+    code, interrupted = wait_through_interrupt(proc)
+    return (code or 130) if interrupted else code
 
 
 # ---------------------------------------------------------------- main
@@ -1192,8 +1224,12 @@ def build_parser():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["afk"]:        # long-running, and every argument belongs to the engine
-        return cmd_afk(argparse.Namespace(afk_args=argv[1:]))
+    i = 0
+    while argv[i:i + 1] and argv[i] in ("--quiet", "--dry-run"):
+        i += 1
+    if argv[i:i + 1] == ["afk"]:   # long-running, and every argument after it belongs to the engine
+        RUN.update(quiet="--quiet" in argv[:i])
+        return cmd_afk(argparse.Namespace(afk_args=argv[i + 1:]))
     args = build_parser().parse_args(argv)
     RUN.update(quiet=args.quiet, dry=args.dry_run)
     if args.cmd == "doctor":
