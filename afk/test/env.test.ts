@@ -61,18 +61,40 @@ test("loadAfkEnv returns the parsed file", () => {
   assert.deepEqual(loadAfkEnv(path), { GH_TOKEN: "t" });
 });
 
-test("requireSecrets needs GH_TOKEN and a token for every agent in use", () => {
-  const missing = (env: Record<string, string>) => {
+test("requireSecrets needs a token for every agent in use", () => {
+  const missing = (env: Record<string, string>, github = false) => {
     try {
-      requireSecrets(env, ["claude", "codex"]);
+      requireSecrets(env, { agents: ["claude", "codex"], github });
       return "";
     } catch (e) {
       return (e as Error).message;
     }
   };
-  assert.match(missing({}), /GH_TOKEN/);
-  assert.match(missing({ GH_TOKEN: "t" }), /CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY/);
-  assert.match(missing({ GH_TOKEN: "t", ANTHROPIC_API_KEY: "k" }), /OPENAI_API_KEY/);
-  assert.equal(missing({ GH_TOKEN: "t", CLAUDE_CODE_OAUTH_TOKEN: "k", OPENAI_API_KEY: "o" }), "");
-  assert.match(missing({ GH_TOKEN: "", ANTHROPIC_API_KEY: "k", OPENAI_API_KEY: "o" }), /GH_TOKEN/);
+  assert.match(missing({}), /CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY/);
+  assert.match(missing({ ANTHROPIC_API_KEY: "k" }), /OPENAI_API_KEY/);
+  assert.equal(missing({ CLAUDE_CODE_OAUTH_TOKEN: "k", OPENAI_API_KEY: "o" }), "");
+});
+
+test("requireSecrets needs GH_TOKEN only when the repository is on GitHub", () => {
+  const agents = ["claude"] as const;
+  const env = { ANTHROPIC_API_KEY: "k" };
+  assert.doesNotThrow(() => requireSecrets(env, { agents, github: false }));
+  assert.throws(() => requireSecrets(env, { agents, github: true }), /GH_TOKEN/);
+  assert.throws(() => requireSecrets({ ...env, GH_TOKEN: "" }, { agents, github: true }), /GH_TOKEN/);
+  assert.doesNotThrow(() => requireSecrets({ ...env, GH_TOKEN: "t" }, { agents, github: true }));
+});
+
+test("parseEnv drops an inline comment from an unquoted value", () => {
+  const text = ["GH_TOKEN=ghp_x  # personal", "A=b#notacomment", "C= # only a comment"].join("\n");
+  assert.deepEqual(parseEnv(text), { GH_TOKEN: "ghp_x", A: "b#notacomment", C: "" });
+});
+
+test("parseEnv takes the quoted content and ignores a trailing comment", () => {
+  const text = ['KEY="v # not a comment" # c', "K2='w'  # c", 'K3="x"'].join("\n");
+  assert.deepEqual(parseEnv(text), { KEY: "v # not a comment", K2: "w", K3: "x" });
+});
+
+test("parseEnv rejects an unterminated quote or junk after the closing quote", () => {
+  assert.throws(() => parseEnv('KEY="abc'), /line 1/);
+  assert.throws(() => parseEnv('KEY="a"b'), /line 1/);
 });

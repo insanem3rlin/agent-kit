@@ -28,7 +28,11 @@ export function afkEnvPath(env: NodeJS.ProcessEnv = process.env, home: string = 
   return join(dir, "afk.env");
 }
 
-/** Parse dotenv text: `KEY=VALUE`, `export KEY=VALUE`, `#` comment lines, matching quotes stripped. */
+/**
+ * Parse dotenv text: `KEY=VALUE`, `export KEY=VALUE`, `#` comment lines.
+ * An unquoted value ends at whitespace followed by `#`; a quoted value is the
+ * quoted content, and only a `# comment` may follow the closing quote.
+ */
 export function parseEnv(source: string): AfkEnv {
   const out: AfkEnv = {};
   source.split(/\r?\n/).forEach((line, i) => {
@@ -36,11 +40,14 @@ export function parseEnv(source: string): AfkEnv {
     if (trimmed === "" || trimmed.startsWith("#")) return;
     const m = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$/.exec(trimmed);
     if (!m) throw new EnvError(`afk.env line ${i + 1}: expected KEY=VALUE`);
-    let value = m[2].trim();
-    if (value.length >= 2 && (value[0] === '"' || value[0] === "'") && value.endsWith(value[0])) {
-      value = value.slice(1, -1);
+    const rest = m[2].trim();
+    if (rest.startsWith('"') || rest.startsWith("'")) {
+      const q = /^(["'])(.*?)\1\s*(?:#.*)?$/.exec(rest);
+      if (!q) throw new EnvError(`afk.env line ${i + 1}: unterminated quote or text after the closing quote`);
+      out[m[1]] = q[2];
+    } else {
+      out[m[1]] = rest.replace(/(^|\s)#.*$/, "").trim();
     }
-    out[m[1]] = value;
   });
   return out;
 }
@@ -57,10 +64,14 @@ export function loadAfkEnv(path: string = afkEnvPath()): AfkEnv {
   return parseEnv(source);
 }
 
-/** Fail unless GH_TOKEN and a token for every listed agent are set and non-empty. */
-export function requireSecrets(env: AfkEnv, agents: readonly AgentName[]): void {
-  if (!env.GH_TOKEN) throw new EnvError("GH_TOKEN is missing or empty in afk.env");
-  for (const agent of new Set(agents)) {
+/**
+ * Fail unless a token for every agent in use is set and non-empty, and, when
+ * the repository is on GitHub (`github`: the backlog is github or origin is a
+ * GitHub URL), GH_TOKEN too. A backlog-md repository elsewhere needs none.
+ */
+export function requireSecrets(env: AfkEnv, need: { agents: readonly AgentName[]; github: boolean }): void {
+  if (need.github && !env.GH_TOKEN) throw new EnvError("GH_TOKEN is missing or empty in afk.env");
+  for (const agent of new Set(need.agents)) {
     const names = AGENT_TOKEN_VARS[agent];
     if (!names.some((n) => env[n])) {
       throw new EnvError(`${names.join(" or ")} is missing or empty in afk.env (needed for agent ${agent})`);

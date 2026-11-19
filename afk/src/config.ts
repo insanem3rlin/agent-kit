@@ -4,6 +4,10 @@
 // rejected. A silent default for baseBranch or the agents would point unattended
 // runs at the wrong branch or the wrong agent, and a typo'd key would otherwise
 // be ignored without a trace. Errors name the field and the problem.
+//
+// Fields added from now on must be optional, with a default applied here, so
+// that a config written before the field existed keeps loading. The six
+// fields below stay required.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 

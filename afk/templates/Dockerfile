@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
 # Align the image user with the host user so bind-mounted files share an owner.
 ARG AGENT_UID=1000
 ARG AGENT_GID=1000
+# Sandcastle hardcodes /home/agent as the agent user's home; do not change it.
 ARG AGENT_HOME=/home/agent
 RUN groupmod -o -g $AGENT_GID node && usermod -o -u $AGENT_UID -g $AGENT_GID -d $AGENT_HOME -m -l agent node
 
@@ -28,12 +29,20 @@ WORKDIR ${AGENT_HOME}
 RUN curl -fsSL https://claude.ai/install.sh | bash
 RUN curl https://cursor.com/install -fsS | bash
 
-# agent-kit itself, with its rules, skills and Claude plugins. The installer links
-# into each agent tool's home, so those homes must exist first.
+# agent-kit itself, with its rules, skills and Claude plugins. AGENT_KIT_REF is the
+# kit commit, branch or tag to install; a changed value busts this layer's cache, so
+# the launcher (issue #7) passes the kit's current commit as the build argument. The
+# agent CLIs above stay floating on purpose, so they are current.
+# The installer links into each agent tool's home, so those homes must exist first.
+# --no-timer: a container has no cron to keep in sync. --no-pull: the checkout is
+# pinned to AGENT_KIT_REF. The plugin install can fail without a login at build time;
+# that must not fail the build, so the exit status is reported and then ignored.
 ARG AGENT_KIT_REPO=https://github.com/insanem3rlin/agent-kit.git
+ARG AGENT_KIT_REF=main
 RUN mkdir -p ~/.claude ~/.codex ~/.cursor \
   && git clone "$AGENT_KIT_REPO" ~/.agent-kit \
-  && ~/.agent-kit/install.sh
+  && git -C ~/.agent-kit checkout "$AGENT_KIT_REF" \
+  && (~/.agent-kit/install.sh --no-timer --no-pull || echo "warning: agent-kit install reported problems (see above)")
 
 # Sandcastle bind-mounts the worktree and sets the working directory at start.
 ENTRYPOINT ["sleep", "infinity"]
