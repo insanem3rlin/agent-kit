@@ -47,7 +47,9 @@ RUN mkdir -p ~/.claude ~/.codex ~/.cursor \
   && { ~/.agent-kit/install.sh --no-timer --no-pull || true; } \
   && test -s ~/.claude/CLAUDE.md \
   && test -s ~/.codex/AGENTS.md \
-  && test -s ~/.claude/agents/reviewer.md
+  && test -s ~/.claude/agents/reviewer.md \
+  && test -s ~/.claude/skills/do-issue/SKILL.md \
+  && test -s ~/.agents/skills/do-issue/SKILL.md
 
 # Sandcastle bind-mounts the worktree and sets the working directory at start.
 ENTRYPOINT ["sleep", "infinity"]

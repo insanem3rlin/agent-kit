@@ -16,6 +16,10 @@ function git(cwd: string, ...args: string[]): string | null {
  * manager window) and gives up after a timeout, so `afk init` cannot hang.
  */
 function gitRemote(cwd: string, ...args: string[]): string | null {
+  // BatchMode only where the user has not chosen an ssh command of their own
+  // (GIT_SSH_COMMAND overrides GIT_SSH and core.sshCommand, so setting it blindly
+  // would swap out their ssh and key).
+  const ownSsh = process.env.GIT_SSH_COMMAND || process.env.GIT_SSH || git(cwd, "config", "core.sshCommand");
   try {
     return execFileSync("git", args, {
       cwd,
@@ -26,7 +30,7 @@ function gitRemote(cwd: string, ...args: string[]): string | null {
         ...process.env,
         GIT_TERMINAL_PROMPT: "0",
         GCM_INTERACTIVE: "never",
-        GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes",
+        ...(ownSsh ? {} : { GIT_SSH_COMMAND: "ssh -o BatchMode=yes" }),
       },
     }).trim();
   } catch {

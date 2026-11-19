@@ -67,6 +67,8 @@ test("the Dockerfile installs agent-kit and the plugins inside the image", () =>
   assert.match(text, /test -s ~\/\.claude\/CLAUDE\.md/);
   assert.match(text, /test -s ~\/\.codex\/AGENTS\.md/);
   assert.match(text, /test -s ~\/\.claude\/agents\/reviewer\.md/);
+  assert.match(text, /test -s ~\/\.claude\/skills\/do-issue\/SKILL\.md/);
+  assert.match(text, /test -s ~\/\.agents\/skills\/do-issue\/SKILL\.md/);
   assert.doesNotMatch(text, /^(COPY|ADD) /m);
   assert.doesNotMatch(text, /VOLUME/);
 });

@@ -45,6 +45,9 @@ test("isGithubUrl rejects other hosts, lookalikes and local paths", () => {
     "https://example.com/github.com/o/r",
     "git@notgithub.com:o/r.git", // leak-check: allow
     "/srv/git/r.git",
+    "C:\\srv\\r.git",
+    "C:/srv/r.git",
+    "gitlab.com:o/r.git",
     "",
   ]) {
     assert.equal(isGithubUrl(url), false, url);
