@@ -20,4 +20,15 @@ done
 [ -z "$paths" ] && { echo "verify: no test directories found"; exit 0; }
 
 # shellcheck disable=SC2086
-exec $pytest_cmd $paths -q -p no:cacheprovider
+$pytest_cmd $paths -q -p no:cacheprovider
+status=$?
+
+# The AFK engine's tests need only Node (22.18+ runs TypeScript directly).
+if ! command -v node >/dev/null 2>&1; then
+    echo "verify: node not found; skipping the afk engine tests"
+elif ! node -e 'const [a,b]=process.versions.node.split(".").map(Number);process.exit(a>22||(a==22&&b>=18)?0:1)'; then
+    echo "verify: node $(node --version) is older than 22.18; skipping the afk engine tests"
+else
+    (cd afk && node --test "test/*.test.ts") || status=1
+fi
+exit $status
