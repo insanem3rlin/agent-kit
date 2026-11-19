@@ -2,39 +2,18 @@
 // worktree, git and gh for everything the run does on the host. None of it runs in
 // the test suite (no Docker, no network); the pure argument builders are tested.
 // sandcastle is imported lazily so the tests need no installed dependencies.
-import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "./config.ts";
 import type { AgentName } from "./config.ts";
 import type { AfkEnv } from "./env.ts";
+import { createGitPorts, exec, gitEnv, remoteHasBranch, removeStale } from "./hostgit.ts";
+import { IssueSetupError, SetupError } from "./run.ts";
 import type { AgentRun, RunPorts, RunSandbox } from "./run.ts";
 
-/** The kit checkout this engine runs from; its HEAD is what the sandbox image installs. */
+/** The kit checkout this engine runs from. The sandbox image installs its newest commit that the remote has (kitCommit). */
 export const KIT_DIR = fileURLToPath(new URL("../../", import.meta.url));
-
-interface ExecOptions {
-  cwd?: string;
-  env?: NodeJS.ProcessEnv;
-  input?: string;
-}
-
-function exec(command: string, args: string[], o: ExecOptions = {}): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = execFile(
-      command,
-      args,
-      { cwd: o.cwd, env: o.env ?? process.env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, windowsHide: true },
-      (err, stdout, stderr) => {
-        if (err) reject(new Error(`${command} ${args.slice(0, 2).join(" ")} failed: ${(stderr || err.message).trim()}`));
-        else resolve(stdout);
-      },
-    );
-    child.stdin?.on("error", () => {});
-    child.stdin?.end(o.input ?? "");
-  });
-}
 
 /** Docker image tag for a repository: `afk-<directory name>`, restricted to what a tag allows. */
 export function imageNameFor(repoDir: string): string {
@@ -55,15 +34,6 @@ export function dockerBuildArgs(o: { imageName: string; repoDir: string; kitRef:
   ];
 }
 
-/** `git push` that authenticates through gh with GH_TOKEN, never forces and names exactly one ref. */
-export function pushArgs(branch: string): string[] {
-  return [
-    "-c", "credential.helper=",
-    "-c", "credential.helper=!gh auth git-credential",
-    "push", "--set-upstream", "origin", `refs/heads/${branch}:refs/heads/${branch}`,
-  ];
-}
-
 export function draftPrArgs(o: { head: string; base: string; title: string }): string[] {
   return ["pr", "create", "--draft", "--head", o.head, "--base", o.base, "--title", o.title, "--body-file", "-"];
 }
@@ -79,24 +49,74 @@ function agentProvider(sandcastle: typeof import("@ai-hero/sandcastle"), agent: 
   }
 }
 
-export function createPorts(afkEnv: AfkEnv): RunPorts {
-  const hostEnv = { ...process.env, ...(afkEnv.GH_TOKEN ? { GH_TOKEN: afkEnv.GH_TOKEN } : {}) };
+/**
+ * The kit commit the sandbox image installs: one that exists on the kit's remote, because the
+ * Dockerfile clones it from there. That is the merge-base of the local HEAD and its upstream, which
+ * is the upstream commit itself when HEAD is level with it. Local commits the remote lacks are not
+ * in the image; `log` says so.
+ */
+export async function kitCommit(kitDir: string, log: (line: string) => void = () => {}): Promise<string> {
+  const git = (...args: string[]) => exec("git", ["-C", kitDir, ...args], { env: gitEnv() }).then((s) => s.trim());
+  try {
+    const head = await git("rev-parse", "HEAD");
+    const commit = await git("merge-base", "HEAD", "@{upstream}");
+    if (commit !== head) log(`afk: the kit checkout is at ${head.slice(0, 12)}, but the sandbox image installs ${commit.slice(0, 12)}, the newest commit its upstream has`);
+    return commit;
+  } catch (e) {
+    throw new SetupError(`cannot tell which kit commit the sandbox image should install (does ${kitDir} track an upstream branch?): ${(e as Error).message}`, { cause: e });
+  }
+}
+
+const ISSUE_SPECIFIC = /already (?:checked out|exists|used by worktree)|is already|worktree/i;
+
+export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) => console.error(l)): RunPorts {
+  const hostEnv = gitEnv({ ...process.env, ...(afkEnv.GH_TOKEN ? { GH_TOKEN: afkEnv.GH_TOKEN } : {}) });
   return {
     async openSandbox({ branch, baseRef, repoDir, env }): Promise<RunSandbox> {
-      const sandcastle = await import("@ai-hero/sandcastle");
-      const { docker } = await import("@ai-hero/sandcastle/sandboxes/docker");
+      const baseBranch = baseRef.replace(/^origin\//, "");
+      // Environment first: a failure here says nothing about the issue.
+      let kitRef: string;
       const imageName = imageNameFor(repoDir);
-      const kitRef = (await exec("git", ["-C", KIT_DIR, "rev-parse", "HEAD"])).trim();
       const uid = process.getuid?.() ?? 1000;
       const gid = process.getgid?.() ?? 1000;
-      await exec("git", ["fetch", "origin", baseRef.replace(/^origin\//, "")], { cwd: repoDir, env: hostEnv });
-      await exec("docker", dockerBuildArgs({ imageName, repoDir, kitRef, uid, gid }));
-      const sandbox = await sandcastle.createSandbox({
-        branch,
-        baseBranch: baseRef,
-        cwd: repoDir,
-        sandbox: docker({ imageName, containerUid: uid, containerGid: gid, env }),
-      });
+      try {
+        await exec("git", ["fetch", "origin", baseBranch], { cwd: repoDir, env: hostEnv, timeoutMs: 120_000 });
+        kitRef = await kitCommit(KIT_DIR, log);
+        await exec("docker", dockerBuildArgs({ imageName, repoDir, kitRef, uid, gid }));
+      } catch (e) {
+        throw e instanceof SetupError ? e : new SetupError(`sandbox environment is not ready: ${(e as Error).message}`, { cause: e });
+      }
+
+      // Then the issue. The daemon only starts unclaimed issues, so a claim on the remote means someone
+      // else owns the branch. Anything local left from an earlier run is stale: sandcastle ignores the
+      // base ref when the branch already exists, so it would resume the old work.
+      let claimed: boolean;
+      try {
+        claimed = await remoteHasBranch(repoDir, branch, hostEnv);
+      } catch (e) {
+        throw new SetupError(`cannot reach origin to check for a claim: ${(e as Error).message}`, { cause: e });
+      }
+      if (claimed) throw new IssueSetupError(`${branch} already exists on the remote, so the issue is claimed`);
+      try {
+        await removeStale(repoDir, branch, hostEnv);
+      } catch (e) {
+        throw new IssueSetupError(`cannot clear the leftover local ${branch}: ${(e as Error).message}`, { cause: e });
+      }
+
+      const sandcastle = await import("@ai-hero/sandcastle");
+      const { docker } = await import("@ai-hero/sandcastle/sandboxes/docker");
+      let sandbox: Awaited<ReturnType<typeof sandcastle.createSandbox>>;
+      try {
+        sandbox = await sandcastle.createSandbox({
+          branch,
+          baseBranch: baseRef,
+          cwd: repoDir,
+          sandbox: docker({ imageName, containerUid: uid, containerGid: gid, env }),
+        });
+      } catch (e) {
+        const msg = (e as Error).message;
+        throw ISSUE_SPECIFIC.test(msg) ? new IssueSetupError(`cannot create the worktree for ${branch}: ${msg}`, { cause: e }) : new SetupError(`cannot start the sandbox: ${msg}`, { cause: e });
+      }
       return {
         workdir: sandbox.worktreePath,
         async runAgent(run: AgentRun) {
@@ -106,26 +126,15 @@ export function createPorts(afkEnv: AfkEnv): RunPorts {
           const r = await sandbox.exec(`cat ${JSON.stringify(path)}`);
           return r.exitCode === 0 ? r.stdout : null;
         },
+        async removeFile(path) {
+          await sandbox.exec(`rm -f ${JSON.stringify(path)}`);
+        },
         async close() {
           await sandbox.close();
         },
       };
     },
-    git: {
-      async commitCount(workdir, baseRef) {
-        return Number((await exec("git", ["rev-list", "--count", `${baseRef}..HEAD`], { cwd: workdir })).trim());
-      },
-      async changedFiles(workdir, baseRef) {
-        const out = await exec("git", ["log", "--no-renames", "--name-only", "--format=", `${baseRef}..HEAD`], { cwd: workdir });
-        return [...new Set(out.split("\n").map((l) => l.trim()).filter(Boolean))];
-      },
-      async resetTo(workdir, baseRef) {
-        await exec("git", ["reset", "--hard", baseRef], { cwd: workdir });
-      },
-      async push(workdir, branch) {
-        await exec("git", pushArgs(branch), { cwd: workdir, env: { ...hostEnv, GIT_TERMINAL_PROMPT: "0" } });
-      },
-    },
+    git: createGitPorts(hostEnv),
     github: {
       async createDraftPr({ repoDir, head, base, title, body }) {
         const out = await exec("gh", draftPrArgs({ head, base, title }), { cwd: repoDir, env: hostEnv, input: body });
