@@ -15,17 +15,43 @@ export interface BacklogIssue {
   agent?: Agent;
 }
 
+/** An issue that carries the AFK label but cannot run as labelled, with the reason to show a human. */
+export interface RejectedIssue {
+  id: string;
+  reason: string;
+}
+
+/**
+ * Where the caller is working. The GitHub backlog ignores it. The Backlog.md
+ * backlog (#6) commits its label swap on the run's branch inside `workdir`.
+ */
+export interface SwapContext {
+  workdir?: string;
+}
+
 export interface Backlog {
   /**
-   * Issues that carry the AFK label, have no open blocker and no claim.
-   * Fail-closed: rejects when the backlog cannot be read in full. It never
-   * guesses that an issue is ready.
+   * Issues that carry the AFK label, have no open blocker, no claim and a
+   * valid agent override. Fail-closed: rejects when the backlog cannot be read
+   * in full. It never guesses that an issue is ready, and has no side effects.
    */
   listReady(): Promise<BacklogIssue[]>;
-  /** Swap the AFK label for `ready-for-human`, then comment. Safe to repeat. */
-  markReadyForHuman(id: string, comment: string): Promise<void>;
-  /** Swap the AFK label for `afk-blocked`, then comment the reason. Safe to repeat. */
-  markBlocked(id: string, reason: string): Promise<void>;
+  /**
+   * Issues that would be ready but for an invalid or conflicting agent
+   * override. They are kept out of listReady, and nothing is changed here: the
+   * daemon (#8) calls markBlocked(id, reason) on each so a human sees why.
+   */
+  listRejected(): Promise<RejectedIssue[]>;
+  /**
+   * Swap the AFK label for `ready-for-human`, then comment. The label swap is
+   * idempotent; the comment is posted again on every call.
+   */
+  markReadyForHuman(id: string, comment: string, ctx?: SwapContext): Promise<void>;
+  /**
+   * Swap the AFK label for `afk-blocked`, then comment the reason. The label
+   * swap is idempotent; the comment is posted again on every call.
+   */
+  markBlocked(id: string, reason: string, ctx?: SwapContext): Promise<void>;
   /** Comment on the issue. */
   comment(id: string, body: string): Promise<void>;
 }

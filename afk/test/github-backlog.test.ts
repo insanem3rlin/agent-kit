@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createGithubBacklog } from "../src/backlog/github.ts";
+import { spawnGh } from "../src/backlog/github.ts";
 import type { Gh } from "../src/backlog/github.ts";
 
 type Call = { args: string[]; input?: string };
@@ -177,4 +178,43 @@ test("rejects ids that are not issue numbers", async () => {
   const { backlog: b } = backlog({});
   await assert.rejects(b.comment("--repo x", "hi"));
   await assert.rejects(b.markBlocked("7; rm", "hi"));
+});
+
+test("spawnGh rejects instead of crashing when the process exits before reading its input", async () => {
+  const big = "x".repeat(8 * 1024 * 1024);
+  await assert.rejects(spawnGh(process.execPath, ["-e", "process.exit(3)"], big), /exited 3|EPIPE|write/);
+});
+
+test("spawnGh decodes multi-byte characters split across chunks", async () => {
+  const script =
+    "const b=Buffer.from('a\u20ac b');process.stdout.write(b.subarray(0,2));" +
+    "setTimeout(()=>process.stdout.write(b.subarray(2)),50)";
+  assert.equal(await spawnGh(process.execPath, ["-e", script]), "a€ b");
+});
+
+test("an invalid or conflicting agent override is reported by listRejected, not ready", async () => {
+  const { backlog: b } = backlog({
+    [LIST]: JSON.stringify([issue(1, ["afk", "afk:gpt"]), issue(2, ["afk", "afk:codex", "afk:cursor"]), issue(3, ["afk"])]),
+    [REFS]: "",
+  });
+  assert.deepEqual((await b.listReady()).map((i) => i.id), ["3"]);
+  const rejected = await b.listRejected();
+  assert.deepEqual(rejected.map((r) => r.id), ["1", "2"]);
+  assert.ok(rejected.every((r) => r.reason.length > 0));
+});
+
+test("listRejected leaves blocked and claimed issues out and has no side effects", async () => {
+  const { backlog: b, calls } = backlog({
+    [LIST]: JSON.stringify([issue(1, ["afk", "afk:gpt"], [{ state: "OPEN" }]), issue(2, ["afk", "afk:gpt"])]),
+    [REFS]: "refs/heads/afk/2\n",
+  });
+  assert.deepEqual(await b.listRejected(), []);
+  assert.ok(calls.every((c) => c.args[0] === "issue" && c.args[1] === "list" || c.args[0] === "api"));
+});
+
+test("the swap methods accept an optional context and the GitHub backlog ignores it", async () => {
+  const { backlog: b, calls } = backlog({});
+  await b.markBlocked("7", "why", { workdir: "/somewhere" });
+  await b.markReadyForHuman("7", "done", { workdir: "/somewhere" });
+  assert.ok(calls.every((c) => !c.args.includes("/somewhere")));
 });

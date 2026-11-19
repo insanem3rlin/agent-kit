@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { AGENTS, BacklogError } from "./types.ts";
-import type { Agent, Backlog, BacklogIssue } from "./types.ts";
+import type { Agent, Backlog, BacklogIssue, RejectedIssue, SwapContext } from "./types.ts";
 
 /** Runs `gh` with the arguments and optional stdin; resolves with stdout, rejects on any failure. */
 export type Gh = (args: string[], input?: string) => Promise<string>;
@@ -17,19 +17,29 @@ export const READY_FOR_HUMAN = "ready-for-human";
 export const AFK_BLOCKED = "afk-blocked";
 const LIST_LIMIT = 1000;
 
-export const defaultGh: Gh = (args, input) =>
-  new Promise((resolve, reject) => {
-    const child = spawn("gh", args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+export function spawnGh(command: string, args: string[], input?: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     let out = "";
     let err = "";
+    let writeError: Error | undefined;
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
+    // gh may exit before reading its input; the failed write must not become an uncaught error.
+    child.stdin.on("error", (e) => (writeError = e));
     child.on("error", reject);
-    child.on("close", (code) =>
-      code === 0 ? resolve(out) : reject(new Error(`gh ${args.slice(0, 2).join(" ")} exited ${code}: ${err.trim()}`)),
-    );
+    child.on("close", (code) => {
+      if (code === 0 && writeError === undefined) return resolve(out);
+      const why = code === 0 ? `could not write its input: ${writeError?.message}` : `exited ${code}: ${err.trim()}`;
+      reject(new Error(`gh ${args.slice(0, 2).join(" ")} ${why}`));
+    });
     child.stdin.end(input ?? "");
   });
+}
+
+export const defaultGh: Gh = (args, input) => spawnGh("gh", args, input);
 
 interface RawIssue {
   number: number;
@@ -61,13 +71,18 @@ function isBlocked(i: RawIssue): boolean {
   return totalCount > nodes.length || nodes.some((n) => n?.state !== "CLOSED");
 }
 
-type AgentChoice = { ok: true; agent?: Agent } | { ok: false };
+type AgentChoice = { ok: true; agent?: Agent } | { ok: false; reason: string };
 
 function chooseAgent(labels: string[], prefix: string): AgentChoice {
   const overrides = labels.filter((l) => l.startsWith(prefix)).map((l) => l.slice(prefix.length));
   if (overrides.length === 0) return { ok: true };
   const agent = AGENTS.find((a) => a === overrides[0]);
-  if (overrides.length > 1 || agent === undefined) return { ok: false };
+  if (overrides.length > 1) {
+    return { ok: false, reason: `conflicting agent labels: ${overrides.map((o) => prefix + o).join(", ")}; keep one` };
+  }
+  if (agent === undefined) {
+    return { ok: false, reason: `unknown agent label ${prefix}${overrides[0]}; use one of ${AGENTS.map((a) => prefix + a).join(", ")}` };
+  }
   return { ok: true, agent };
 }
 
@@ -114,32 +129,43 @@ export function createGithubBacklog(options: GithubBacklogOptions): Backlog {
     await run(["issue", "comment", n, "--repo", repo, "--body-file", "-"], comment);
   }
 
+  async function scan(): Promise<{ ready: BacklogIssue[]; rejected: RejectedIssue[] }> {
+    const out = await run([
+      "issue", "list", "--repo", repo, "--label", label, "--state", "open",
+      "--limit", String(LIST_LIMIT), "--json", "number,title,body,url,labels,blockedBy",
+    ]);
+    let issues: RawIssue[];
+    try {
+      issues = parseIssues(out);
+    } catch (cause) {
+      throw new BacklogError(`unreadable gh output: ${String(cause)}`, { cause });
+    }
+    if (issues.length >= LIST_LIMIT) throw new BacklogError("backlog listing hit its limit; refusing to guess");
+    const claimed = await claimedIds();
+    const ready: BacklogIssue[] = [];
+    const rejected: RejectedIssue[] = [];
+    for (const i of issues) {
+      const id = String(i.number);
+      if (claimed.has(id) || isBlocked(i)) continue;
+      const choice = chooseAgent(i.labels.map((l) => l.name), `${label}:`);
+      if (!choice.ok) {
+        rejected.push({ id, reason: choice.reason });
+        continue;
+      }
+      ready.push({ id, title: i.title, body: i.body ?? "", url: i.url, ...(choice.agent && { agent: choice.agent }) });
+    }
+    return { ready, rejected };
+  }
+
   return {
     async listReady() {
-      const out = await run([
-        "issue", "list", "--repo", repo, "--label", label, "--state", "open",
-        "--limit", String(LIST_LIMIT), "--json", "number,title,body,url,labels,blockedBy",
-      ]);
-      let issues: RawIssue[];
-      try {
-        issues = parseIssues(out);
-      } catch (cause) {
-        throw new BacklogError(`unreadable gh output: ${String(cause)}`, { cause });
-      }
-      if (issues.length >= LIST_LIMIT) throw new BacklogError("backlog listing hit its limit; refusing to guess");
-      const claimed = await claimedIds();
-      const ready: BacklogIssue[] = [];
-      for (const i of issues) {
-        const id = String(i.number);
-        if (claimed.has(id) || isBlocked(i)) continue;
-        const choice = chooseAgent(i.labels.map((l) => l.name), `${label}:`);
-        if (!choice.ok) continue;
-        ready.push({ id, title: i.title, body: i.body ?? "", url: i.url, ...(choice.agent && { agent: choice.agent }) });
-      }
-      return ready;
+      return (await scan()).ready;
     },
-    markReadyForHuman: (id, comment) => swap(id, READY_FOR_HUMAN, comment),
-    markBlocked: (id, reason) => swap(id, AFK_BLOCKED, reason),
+    async listRejected() {
+      return (await scan()).rejected;
+    },
+    markReadyForHuman: (id, comment, _ctx) => swap(id, READY_FOR_HUMAN, comment),
+    markBlocked: (id, reason, _ctx) => swap(id, AFK_BLOCKED, reason),
     async comment(id, body) {
       await run(["issue", "comment", requireIssueNumber(id), "--repo", repo, "--body-file", "-"], body);
     },
