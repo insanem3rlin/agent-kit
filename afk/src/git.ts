@@ -10,14 +10,43 @@ function git(cwd: string, ...args: string[]): string | null {
   }
 }
 
+/**
+ * Like git(), for a command that talks to the remote: it never prompts (no
+ * terminal prompt, no SSH host-key or passphrase question, no credential
+ * manager window) and gives up after a timeout, so `afk init` cannot hang.
+ */
+function gitRemote(cwd: string, ...args: string[]): string | null {
+  try {
+    return execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 15_000,
+      env: {
+        ...process.env,
+        GIT_TERMINAL_PROMPT: "0",
+        GCM_INTERACTIVE: "never",
+        GIT_SSH_COMMAND: process.env.GIT_SSH_COMMAND ?? "ssh -o BatchMode=yes",
+      },
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
 /** The root of the work tree containing `dir`, or null outside a git work tree. */
 export function repoRoot(dir: string): string | null {
   return git(dir, "rev-parse", "--show-toplevel") || null;
 }
 
-/** Whether a remote URL points at github.com (https, http, git, ssh:// and scp-style forms). */
+/**
+ * Whether a remote URL points at github.com (https, http, git, ssh:// and
+ * scp-style forms, with or without a user). An SSH host alias from
+ * ~/.ssh/config (such as `git@github-work:o/r.git`) is not resolved and reads
+ * as not GitHub.
+ */
 export function isGithubUrl(url: string): boolean {
-  const scp = /^[^@\s/:]+@([^:/\s]+):/.exec(url);
+  const scp = /^(?:[^@\s/:]+@)?([^:/\s]+):(?!\/\/)/.exec(url);
   if (scp) return scp[1].toLowerCase() === "github.com";
   try {
     return new URL(url).hostname.toLowerCase() === "github.com";
@@ -43,7 +72,7 @@ export function detectBaseBranch(dir: string): string {
   if (hasOrigin) {
     const local = git(dir, "symbolic-ref", "--short", "refs/remotes/origin/HEAD");
     if (local) return local.replace(/^origin\//, "");
-    const remote = git(dir, "ls-remote", "--symref", "origin", "HEAD");
+    const remote = gitRemote(dir, "ls-remote", "--symref", "origin", "HEAD");
     const m = remote && /^ref: refs\/heads\/(\S+)\s+HEAD$/m.exec(remote);
     if (m) return m[1];
   }

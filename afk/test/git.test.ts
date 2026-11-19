@@ -31,6 +31,7 @@ test("isGithubUrl accepts the https, ssh and scp forms of github.com", () => {
     "git@github.com:o/r.git", // leak-check: allow
     "ssh://git@github.com/o/r.git", // leak-check: allow
     "git://github.com/o/r.git",
+    "github.com:o/r.git",
   ]) {
     assert.equal(isGithubUrl(url), true, url);
   }

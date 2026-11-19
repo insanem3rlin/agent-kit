@@ -35,14 +35,19 @@ RUN curl https://cursor.com/install -fsS | bash
 # agent CLIs above stay floating on purpose, so they are current.
 # The installer links into each agent tool's home, so those homes must exist first.
 # --no-timer: a container has no cron to keep in sync. --no-pull: the checkout is
-# pinned to AGENT_KIT_REF. The plugin install can fail without a login at build time;
-# that must not fail the build, so the exit status is reported and then ignored.
+# pinned to AGENT_KIT_REF. The plugin install can fail without a login at build time,
+# so the installer's exit status is not fatal on its own; the checks after it are. An
+# image without the rules or the role agents must never be built, because agents in it
+# would run unattended without them.
 ARG AGENT_KIT_REPO=https://github.com/insanem3rlin/agent-kit.git
 ARG AGENT_KIT_REF=main
 RUN mkdir -p ~/.claude ~/.codex ~/.cursor \
   && git clone "$AGENT_KIT_REPO" ~/.agent-kit \
   && git -C ~/.agent-kit checkout "$AGENT_KIT_REF" \
-  && (~/.agent-kit/install.sh --no-timer --no-pull || echo "warning: agent-kit install reported problems (see above)")
+  && { ~/.agent-kit/install.sh --no-timer --no-pull || true; } \
+  && test -s ~/.claude/CLAUDE.md \
+  && test -s ~/.codex/AGENTS.md \
+  && test -s ~/.claude/agents/reviewer.md
 
 # Sandcastle bind-mounts the worktree and sets the working directory at start.
 ENTRYPOINT ["sleep", "infinity"]

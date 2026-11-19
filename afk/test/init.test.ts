@@ -62,6 +62,11 @@ test("the Dockerfile installs agent-kit and the plugins inside the image", () =>
   assert.match(text, /@openai\/codex/);
   assert.match(text, /cursor\.com\/install/);
   assert.match(text, /ENTRYPOINT \["sleep", "infinity"\]/);
+  // A failed kit install must fail the build; only the plugin step may fail softly.
+  assert.doesNotMatch(text, /\|\| echo/);
+  assert.match(text, /test -s ~\/\.claude\/CLAUDE\.md/);
+  assert.match(text, /test -s ~\/\.codex\/AGENTS\.md/);
+  assert.match(text, /test -s ~\/\.claude\/agents\/reviewer\.md/);
   assert.doesNotMatch(text, /^(COPY|ADD) /m);
   assert.doesNotMatch(text, /VOLUME/);
 });
