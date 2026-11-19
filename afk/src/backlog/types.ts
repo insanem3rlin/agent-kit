@@ -23,7 +23,8 @@ export interface RejectedIssue {
 
 /**
  * Where the caller is working. The GitHub backlog ignores it. The Backlog.md
- * backlog (#6) commits its label swap on the run's branch inside `workdir`.
+ * backlog commits its label swap and comments on the run's branch
+ * `afk/<id>` inside `workdir` and never pushes; the run pushes.
  */
 export interface SwapContext {
   workdir?: string;
@@ -52,8 +53,13 @@ export interface Backlog {
    * swap is idempotent; the comment is posted again on every call.
    */
   markBlocked(id: string, reason: string, ctx?: SwapContext): Promise<void>;
-  /** Comment on the issue. */
-  comment(id: string, body: string): Promise<void>;
+  /**
+   * Comment on the issue. The GitHub backlog ignores `ctx`. The Backlog.md
+   * backlog appends the comment to the task file and commits it in
+   * `ctx.workdir`, and rejects without one, because it never writes to the
+   * base branch.
+   */
+  comment(id: string, body: string, ctx?: SwapContext): Promise<void>;
 }
 
 /** Thrown when the backlog cannot be read or written. */

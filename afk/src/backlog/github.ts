@@ -71,9 +71,9 @@ function isBlocked(i: RawIssue): boolean {
   return totalCount > nodes.length || nodes.some((n) => n?.state !== "CLOSED");
 }
 
-type AgentChoice = { ok: true; agent?: Agent } | { ok: false; reason: string };
+export type AgentChoice = { ok: true; agent?: Agent } | { ok: false; reason: string };
 
-function chooseAgent(labels: string[], prefix: string): AgentChoice {
+export function chooseAgent(labels: string[], prefix: string): AgentChoice {
   const overrides = labels.filter((l) => l.startsWith(prefix)).map((l) => l.slice(prefix.length));
   if (overrides.length === 0) return { ok: true };
   const agent = AGENTS.find((a) => a === overrides[0]);
