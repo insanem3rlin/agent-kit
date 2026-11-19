@@ -183,6 +183,26 @@ test("the final status can be a block list in config.yml; without a config it is
   assert.deepEqual((await bl(f2).listReady()).map((i) => i.id), ["task-1"]);
 });
 
+test("a root backlog.config.yml decides the final status and wins over backlog/config.yml", async () => {
+  const f = fixture();
+  f.publish({
+    "backlog.config.yml": 'statuses: ["To Do", "Done", "Released"]\n',
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-2"] }),
+    [T(2)]: taskFile({ id: "task-2", status: "Done" }),
+    [T(3)]: taskFile({ id: "task-3", labels: ["afk"], deps: ["task-4"] }),
+    [T(4)]: taskFile({ id: "task-4", status: "Released" }),
+  });
+  assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["task-3"]);
+  const f2 = fixture();
+  f2.publish({
+    "backlog.config.yml": 'statuses: ["To Do", "Shipped"]\n',
+    "backlog/config.yml": 'statuses: ["To Do", "Done"]\n',
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-2"] }),
+    [T(2)]: taskFile({ id: "task-2", status: "Shipped" }),
+  });
+  assert.deepEqual((await bl(f2).listReady()).map((i) => i.id), ["task-1"]);
+});
+
 test("an unreadable config.yml fails closed", async () => {
   const f = fixture();
   f.publish({ "backlog/config.yml": "statuses: nonsense\n", [T(1)]: taskFile({ id: "task-1", labels: ["afk"] }) });

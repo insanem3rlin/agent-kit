@@ -61,6 +61,11 @@ export const defaultGit: Git = (args, options) =>
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
     child.on("error", reject);
+    // A timed-out git is killed, but on Windows its helpers (git-remote-https)
+    // keep the pipes open, so "close" may never come. Settle on the kill itself.
+    child.on("exit", (_code, signal) => {
+      if (signal) reject(new Error(`git ${args.slice(0, 2).join(" ")} was killed (${signal}): ${err.trim()}`));
+    });
     child.on("close", (code) => {
       if (code === 0) return resolve(out);
       reject(new Error(`git ${args.slice(0, 2).join(" ")} exited ${code}: ${err.trim()}`));
@@ -310,19 +315,24 @@ export function createBacklogMdBacklog(options: BacklogMdBacklogOptions): Backlo
     return ids;
   }
 
-  /** The final status from backlog/config.yml of the base ref, or "Done" without a config. */
+  /**
+   * The final status from the base ref's Backlog.md config, or "Done" without one.
+   * Backlog.md reads a root `backlog.config.yml` first and `<dir>/config.yml` otherwise.
+   */
   async function finalStatus(): Promise<string> {
-    const names = (await run(["ls-tree", "-z", "--name-only", BASE_REF, "--", `${dir}/config.yml`], repoDir)).split("\0");
-    if (!names.includes(`${dir}/config.yml`)) return "done";
+    const candidates = ["backlog.config.yml", `${dir}/config.yml`];
+    const names = (await run(["ls-tree", "-z", "--name-only", BASE_REF, "--", ...candidates], repoDir)).split(" ");
+    const file = candidates.find((c) => names.includes(c));
+    if (!file) return "done";
     let statuses: string[] | undefined;
     try {
-      statuses = parseStatuses(await run(["show", `${BASE_REF}:${dir}/config.yml`], repoDir));
+      statuses = parseStatuses(await run(["show", `${BASE_REF}:${file}`], repoDir));
     } catch (cause) {
-      throw new BacklogError(`unreadable ${dir}/config.yml: ${String(cause)}`, { cause });
+      throw new BacklogError(`unreadable ${file}: ${String(cause)}`, { cause });
     }
     if (statuses === undefined) return "done";
     const last = statuses[statuses.length - 1]?.trim();
-    if (!last) throw new BacklogError(`${dir}/config.yml has an empty statuses list`);
+    if (!last) throw new BacklogError(`${file} has an empty statuses list`);
     return last.toLowerCase();
   }
 
