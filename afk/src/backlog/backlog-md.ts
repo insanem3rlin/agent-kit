@@ -6,7 +6,12 @@
 //     remote into the private ref `refs/afk/base` and reads the task files from
 //     that ref, never from the checkout, so a checkout on an AFK branch or with
 //     local edits cannot change the answer. Claims come from
-//     `git ls-remote --heads <remote> refs/heads/afk/*`.
+//     `git ls-remote --heads <remote> refs/heads/afk/*`. The fetch and the
+//     ls-remote never prompt and time out (remoteGitOptions in ../git.ts).
+//     Tasks come from tasks/, completed/ and archive/tasks/; only tasks/ can
+//     run, but every folder counts for dependencies and duplicate ids. Done is
+//     the last entry of `statuses` in config.yml (default "Done"), and ids
+//     compare case-insensitively without zero-padding.
 //   - Writing (markReadyForHuman, markBlocked, comment): edits the task file in
 //     `ctx.workdir`, which must be the run's checkout on branch `afk/<id>`, and
 //     makes one `git commit` there. Without a workdir, or on any other branch,
@@ -17,12 +22,13 @@
 import { spawn } from "node:child_process";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { remoteGitOptions } from "../git.ts";
 import { AFK_BLOCKED, READY_FOR_HUMAN, chooseAgent } from "./github.ts";
 import { BacklogError } from "./types.ts";
 import type { Backlog, BacklogIssue, RejectedIssue, SwapContext } from "./types.ts";
 
 /** Runs `git` with the arguments; resolves with stdout, rejects on any failure. */
-export type Git = (args: string[], options?: { cwd?: string }) => Promise<string>;
+export type Git = (args: string[], options?: { cwd?: string; remote?: boolean }) => Promise<string>;
 
 export interface BacklogMdBacklogOptions {
   /** A checkout of the repository; used for `fetch` and `ls-remote`, never read for task files. */
@@ -45,7 +51,9 @@ const COMMENTS_HEADING = "## AFK comments";
 
 export const defaultGit: Git = (args, options) =>
   new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd: options?.cwd, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    // Commands that talk to the remote never prompt and time out (see remoteGitOptions).
+    const network = options?.remote && options.cwd !== undefined ? remoteGitOptions(options.cwd) : {};
+    const child = spawn("git", args, { cwd: options?.cwd, ...network, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     let out = "";
     let err = "";
     child.stdout.setEncoding("utf8");
@@ -144,6 +152,11 @@ function parseFile(text: string): Parsed {
   const fm = lines.slice(1, close);
   const after = lines.slice(close + 1);
 
+  const fields = readFields(fm);
+  return finish(eol, fm, after, fields);
+}
+
+function readFields(fm: string[]): Map<string, Field> {
   const fields = new Map<string, Field>();
   let current: Field | undefined;
   fm.forEach((line, i) => {
@@ -172,7 +185,19 @@ function parseFile(text: string): Parsed {
     }
     throw new Error(`cannot read frontmatter line ${JSON.stringify(line)}`);
   });
+  return fields;
+}
 
+function listField(fields: Map<string, Field>, name: string): string[] | undefined {
+  const f = fields.get(name);
+  if (!f) return undefined;
+  if (f.rest === "") return f.items;
+  if (f.items.length > 0 || f.rest.includes("\u0000")) throw new Error(`field ${name} is not a plain list`);
+  if (f.rest.startsWith("[") && f.rest.endsWith("]")) return splitFlow(f.rest.slice(1, -1));
+  throw new Error(`field ${name} is not a list`);
+}
+
+function finish(eol: string, fm: string[], after: string[], fields: Map<string, Field>): Parsed {
   const scalar = (name: string, required: boolean): string => {
     const f = fields.get(name);
     if (!f) {
@@ -189,14 +214,7 @@ function parseFile(text: string): Parsed {
     }
     return unquote(f.rest);
   };
-  const list = (name: string): string[] => {
-    const f = fields.get(name);
-    if (!f) return [];
-    if (f.rest === "") return f.items;
-    if (f.items.length > 0 || f.rest.includes("\u0000")) throw new Error(`field ${name} is not a plain list`);
-    if (f.rest.startsWith("[") && f.rest.endsWith("]")) return splitFlow(f.rest.slice(1, -1));
-    throw new Error(`field ${name} is not a list`);
-  };
+  const list = (name: string): string[] => listField(fields, name) ?? [];
 
   const id = scalar("id", true);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) throw new Error(`unusable task id ${JSON.stringify(id)}`);
@@ -219,6 +237,16 @@ function parseFile(text: string): Parsed {
 
 export function parseTask(text: string): Task {
   return parseFile(text).task;
+}
+
+/** The statuses of backlog/config.yml; the last one is the final ("Done") status. */
+export function parseStatuses(text: string): string[] | undefined {
+  return listField(readFields(text.replace(/^\uFEFF/, "").split(/\r?\n/)), "statuses");
+}
+
+/** Ids compare case-insensitively and without zero-padding: BACK-001.02 is BACK-1.2. */
+export function normalizeId(id: string): string {
+  return id.trim().toLowerCase().replace(/\b0+(?=\d)/g, "");
 }
 
 function formatItem(s: string): string {
@@ -253,8 +281,6 @@ function requireTaskId(id: string): string {
   return id;
 }
 
-const isDone = (t: Task) => t.status.trim().toLowerCase() === "done";
-
 export function createBacklogMdBacklog(options: BacklogMdBacklogOptions): Backlog {
   const { repoDir, label } = options;
   const remote = options.remote ?? "origin";
@@ -266,30 +292,48 @@ export function createBacklogMdBacklog(options: BacklogMdBacklogOptions): Backlo
     throw new BacklogError(`backlogDir must be a relative path inside the repository: ${JSON.stringify(dir)}`);
   }
 
-  async function run(args: string[], cwd: string): Promise<string> {
+  async function run(args: string[], cwd: string, remoteCall = false): Promise<string> {
     try {
-      return await git(args, { cwd });
+      return await git(args, remoteCall ? { cwd, remote: true } : { cwd });
     } catch (cause) {
       throw new BacklogError(`Backlog.md backlog is not readable or writable: ${String(cause)}`, { cause });
     }
   }
 
   async function claimedIds(): Promise<Set<string>> {
-    const out = await run(["ls-remote", "--heads", remote, "refs/heads/afk/*"], repoDir);
+    const out = await run(["ls-remote", "--heads", remote, "refs/heads/afk/*"], repoDir, true);
     const ids = new Set<string>();
     for (const line of out.split(/\r?\n/)) {
       const m = /^[0-9a-f]+\s+refs\/heads\/afk\/(.+)$/.exec(line.trim());
-      if (m) ids.add(m[1].toLowerCase());
+      if (m) ids.add(normalizeId(m[1]));
     }
     return ids;
   }
 
-  async function readTasks(): Promise<{ path: string; task: Task }[]> {
-    await run(["fetch", "--quiet", remote, `+refs/heads/${baseBranch}:${BASE_REF}`], repoDir);
-    const listing = await run(["ls-tree", "-r", "-z", "--name-only", BASE_REF, "--", `${dir}/tasks`, `${dir}/completed`], repoDir);
+  /** The final status from backlog/config.yml of the base ref, or "Done" without a config. */
+  async function finalStatus(): Promise<string> {
+    const names = (await run(["ls-tree", "-z", "--name-only", BASE_REF, "--", `${dir}/config.yml`], repoDir)).split("\0");
+    if (!names.includes(`${dir}/config.yml`)) return "done";
+    let statuses: string[] | undefined;
+    try {
+      statuses = parseStatuses(await run(["show", `${BASE_REF}:${dir}/config.yml`], repoDir));
+    } catch (cause) {
+      throw new BacklogError(`unreadable ${dir}/config.yml: ${String(cause)}`, { cause });
+    }
+    if (statuses === undefined) return "done";
+    const last = statuses[statuses.length - 1]?.trim();
+    if (!last) throw new BacklogError(`${dir}/config.yml has an empty statuses list`);
+    return last.toLowerCase();
+  }
+
+  async function readTasks(): Promise<{ path: string; task: Task; live: boolean }[]> {
+    const listing = await run(
+      ["ls-tree", "-r", "-z", "--name-only", BASE_REF, "--", `${dir}/tasks`, `${dir}/completed`, `${dir}/archive/tasks`],
+      repoDir,
+    );
     const paths = listing.split("\0").filter((p) => p.endsWith(".md"));
     paths.sort((a, b) => a.localeCompare(b, "en", { numeric: true }));
-    const tasks: { path: string; task: Task }[] = [];
+    const tasks: { path: string; task: Task; live: boolean }[] = [];
     const seen = new Map<string, string>();
     for (const path of paths) {
       const text = await run(["show", `${BASE_REF}:${path}`], repoDir);
@@ -299,26 +343,30 @@ export function createBacklogMdBacklog(options: BacklogMdBacklogOptions): Backlo
       } catch (cause) {
         throw new BacklogError(`unreadable task file ${path}: ${String(cause)}`, { cause });
       }
-      const key = task.id.toLowerCase();
+      const key = normalizeId(task.id);
       const first = seen.get(key);
       if (first !== undefined) throw new BacklogError(`duplicate task id ${task.id} in ${first} and ${path}`);
       seen.set(key, path);
-      tasks.push({ path, task });
+      // Only tasks under tasks/ can run; completed/ (legacy) and archive/tasks are archived.
+      tasks.push({ path, task, live: path.startsWith(`${dir}/tasks/`) });
     }
     return tasks;
   }
 
   async function scan(): Promise<{ ready: BacklogIssue[]; rejected: RejectedIssue[] }> {
+    await run(["fetch", "--quiet", remote, `+refs/heads/${baseBranch}:${BASE_REF}`], repoDir, true);
+    const final = await finalStatus();
+    const isDone = (t: Task) => t.status.trim().toLowerCase() === final;
     const tasks = await readTasks();
     const claimed = await claimedIds();
-    const byId = new Map(tasks.map((t) => [t.task.id.toLowerCase(), t.task]));
+    const byId = new Map(tasks.map((t) => [normalizeId(t.task.id), t.task]));
     const ready: BacklogIssue[] = [];
     const rejected: RejectedIssue[] = [];
-    for (const { path, task } of tasks) {
-      if (!task.labels.includes(label) || isDone(task)) continue;
-      if (claimed.has(task.id.toLowerCase())) continue;
+    for (const { path, task, live } of tasks) {
+      if (!live || !task.labels.includes(label) || isDone(task)) continue;
+      if (claimed.has(normalizeId(task.id))) continue;
       // An unknown dependency counts as open.
-      if (task.dependencies.some((d) => { const dep = byId.get(d.trim().toLowerCase()); return dep === undefined || !isDone(dep); })) continue;
+      if (task.dependencies.some((d) => { const dep = byId.get(normalizeId(d)); return dep === undefined || !isDone(dep); })) continue;
       const choice = chooseAgent(task.labels, `${label}:`);
       if (!choice.ok) {
         rejected.push({ id: task.id, reason: choice.reason });

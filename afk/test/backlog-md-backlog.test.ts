@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { BacklogError } from "../src/backlog/types.ts";
-import { createBacklogMdBacklog } from "../src/backlog/backlog-md.ts";
+import { createBacklogMdBacklog, defaultGit } from "../src/backlog/backlog-md.ts";
 import type { Git } from "../src/backlog/backlog-md.ts";
 
 function g(cwd: string, ...args: string[]): string {
@@ -124,13 +124,119 @@ test("an unknown dependency counts as open; a dependency under completed/ counts
   assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["task-2"]);
 });
 
-test("a dependency that is archived is unknown and counts as open", async () => {
+test("a Done task under archive/tasks satisfies a dependency; an archived task that is not Done does not", async () => {
   const f = fixture();
   f.publish({
     [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-8"] }),
+    [T(2)]: taskFile({ id: "task-2", labels: ["afk"], deps: ["task-9"] }),
     "backlog/archive/tasks/task-8 - Old.md": taskFile({ id: "task-8", status: "Done" }),
+    "backlog/archive/tasks/task-9 - Cancelled.md": taskFile({ id: "task-9", status: "To Do" }),
+  });
+  assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["task-1"]);
+});
+
+test("archived and completed tasks are never ready, even with the label", async () => {
+  const f = fixture();
+  f.publish({
+    "backlog/archive/tasks/task-8 - Old.md": taskFile({ id: "task-8", status: "To Do", labels: ["afk"] }),
+    "backlog/completed/task-9 - Old.md": taskFile({ id: "task-9", status: "To Do", labels: ["afk"] }),
   });
   assert.deepEqual(await bl(f).listReady(), []);
+  assert.deepEqual(await bl(f).listRejected(), []);
+});
+
+test("a duplicate id across tasks and archive/tasks fails closed", async () => {
+  const f = fixture();
+  f.publish({
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"] }),
+    "backlog/archive/tasks/task-1 - Dup.md": taskFile({ id: "task-1", status: "Done" }),
+  });
+  await assert.rejects(bl(f).listReady(), /duplicate/i);
+});
+
+test("Done is the last status in backlog/config.yml of the base branch, compared case-insensitively", async () => {
+  const f = fixture();
+  f.publish({
+    "backlog/config.yml": 'project_name: "P"\nstatuses: ["To Do", "In Progress", "Shipped"]\nlabels: []\n',
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-2", "task-3"] }),
+    [T(2)]: taskFile({ id: "task-2", status: "shipped" }),
+    [T(3)]: taskFile({ id: "task-3", status: "Done" }),
+    [T(4)]: taskFile({ id: "task-4", labels: ["afk"], deps: ["task-2"] }),
+    [T(5)]: taskFile({ id: "task-5", labels: ["afk"], status: "Shipped" }),
+  });
+  assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["task-4"]);
+});
+
+test("the final status can be a block list in config.yml; without a config it is Done", async () => {
+  const f = fixture();
+  f.publish({
+    "backlog/config.yml": "statuses:\n  - To Do\n  - 'Released'\n# comment\ndefault_status: To Do\n",
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-2"] }),
+    [T(2)]: taskFile({ id: "task-2", status: "Released" }),
+  });
+  assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["task-1"]);
+  const f2 = fixture();
+  f2.publish({
+    [T(1)]: taskFile({ id: "task-1", labels: ["afk"], deps: ["task-2"] }),
+    [T(2)]: taskFile({ id: "task-2", status: "DONE" }),
+  });
+  assert.deepEqual((await bl(f2).listReady()).map((i) => i.id), ["task-1"]);
+});
+
+test("an unreadable config.yml fails closed", async () => {
+  const f = fixture();
+  f.publish({ "backlog/config.yml": "statuses: nonsense\n", [T(1)]: taskFile({ id: "task-1", labels: ["afk"] }) });
+  await assert.rejects(bl(f).listReady(), BacklogError);
+  const f2 = fixture();
+  f2.publish({ "backlog/config.yml": "statuses: []\n", [T(1)]: taskFile({ id: "task-1", labels: ["afk"] }) });
+  await assert.rejects(bl(f2).listReady(), BacklogError);
+});
+
+test("ids compare after normalising zero-padding and case", async () => {
+  const f = fixture();
+  f.publish({
+    [T(1)]: taskFile({ id: "BACK-001.02", labels: ["afk"], deps: ["back-3", "BACK-0010.1"] }),
+    [T(3)]: taskFile({ id: "BACK-003", status: "Done" }),
+    [T(10)]: taskFile({ id: "BACK-10.01", status: "Done" }),
+    [T(4)]: taskFile({ id: "BACK-4", labels: ["afk"], deps: ["BACK-1.2"] }),
+  });
+  assert.deepEqual((await bl(f).listReady()).map((i) => i.id), ["BACK-001.02"]);
+  // BACK-001.02 and BACK-1.2 are one id: a second file with it is a duplicate.
+  const f2 = fixture();
+  f2.publish({
+    [T(1)]: taskFile({ id: "BACK-1.2", labels: ["afk"] }),
+    [T(2)]: taskFile({ id: "BACK-001.02" }),
+  });
+  await assert.rejects(bl(f2).listReady(), /duplicate/i);
+  // A claim branch with another padding still claims the task.
+  const f3 = fixture();
+  f3.publish({ [T(1)]: taskFile({ id: "BACK-001", labels: ["afk"] }) });
+  g(f3.repo, "push", "-q", "origin", "main:refs/heads/afk/BACK-1");
+  assert.deepEqual(await bl(f3).listReady(), []);
+});
+
+test("fetch and ls-remote run in no-prompt mode; local git calls do not", async () => {
+  const f = fixture();
+  f.publish({ [T(1)]: taskFile({ id: "task-1", labels: ["afk"] }) });
+  const seen: { args: string[]; remote?: boolean }[] = [];
+  const recording: Git = async (args, opts) => {
+    seen.push({ args, remote: opts?.remote });
+    return execFileSync("git", args, { cwd: opts?.cwd, encoding: "utf8" });
+  };
+  await bl(f, { git: recording }).listReady();
+  for (const s of seen) {
+    const network = s.args[0] === "fetch" || s.args[0] === "ls-remote";
+    assert.equal(s.remote === true, network, s.args.join(" "));
+  }
+  assert.ok(seen.some((s) => s.args[0] === "fetch") && seen.some((s) => s.args[0] === "ls-remote"));
+});
+
+test("the default git runs remote calls without prompts", async () => {
+  const root = mkdtempSync(join(tmpdir(), "afk-bmd-env-"));
+  g(root, "init", "-q");
+  const probe = ["-c", "alias.probe=!printenv GIT_TERMINAL_PROMPT GCM_INTERACTIVE", "probe"];
+  const out = await defaultGit(probe, { cwd: root, remote: true });
+  assert.equal(out.trim().split(/\r?\n/).join(","), "0,never");
 });
 
 test("a task with an afk/<id> branch on the remote is claimed and not ready", async () => {
