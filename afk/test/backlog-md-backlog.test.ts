@@ -254,9 +254,10 @@ test("fetch and ls-remote run in no-prompt mode; local git calls do not", async 
 test("the default git runs remote calls without prompts", async () => {
   const root = mkdtempSync(join(tmpdir(), "afk-bmd-env-"));
   g(root, "init", "-q");
-  const probe = ["-c", "alias.probe=!printenv GIT_TERMINAL_PROMPT GCM_INTERACTIVE", "probe"];
+  // echo, not printenv: BSD printenv (macOS) takes a single name.
+  const probe = ["-c", 'alias.probe=!echo "$GIT_TERMINAL_PROMPT,$GCM_INTERACTIVE"', "probe"];
   const out = await defaultGit(probe, { cwd: root, remote: true });
-  assert.equal(out.trim().split(/\r?\n/).join(","), "0,never");
+  assert.equal(out.trim(), "0,never");
 });
 
 test("a task with an afk/<id> branch on the remote is claimed and not ready", async () => {
