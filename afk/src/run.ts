@@ -259,7 +259,7 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
         say(`afk: kept ${snap.dir}: the push of ${branch} failed and the work is only there`);
       }
       const kept = pushFailed ? { keptClone: snap.dir } : {};
-      if (input.signal?.aborted) return { ...interrupted(), ...kept };
+      if (input.signal?.aborted) return interruptedKeep();
       if (!isMd) {
         await backlog.markBlocked(issue.id, why);
         return { status: "blocked", reason: why, ...kept };

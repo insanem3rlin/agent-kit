@@ -575,6 +575,37 @@ test("an aborted GitHub run does not relabel the issue either", async () => {
   assert.deepEqual(s.backlogCalls, []);
 });
 
+/** A setup whose signal aborts while the clean clone is being prepared, after the agents finished. */
+function abortDuringImport(o: Options = {}) {
+  const ac = new AbortController();
+  const s = setup(o);
+  const create = s.ports.git.createClean;
+  s.ports.git.createClean = async (snap, branch, tip) => {
+    ac.abort();
+    return create(snap, branch, tip);
+  };
+  return { ac, s };
+}
+
+test("an abort during the host-side checks, with clean guards, does not push and keeps the run clone", async () => {
+  const { ac, s } = abortDuringImport();
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(pushes(s), []);
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.includes("disposeRun"));
+});
+
+test("an abort during the host-side checks, when a guard then fails, still keeps the run clone", async () => {
+  const { ac, s } = abortDuringImport({ merges: 1 });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.includes("disposeRun"));
+});
+
 test("an abort after the push does not stop the ready path", async () => {
   const ac = new AbortController();
   const s = setup({ failPush: () => (ac.abort(), false) });
