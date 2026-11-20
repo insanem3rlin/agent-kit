@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { test } from "node:test";
-import { ImportError, createGitPorts, githubSlug, pushArgs, readRefDirect, remoteHasBranch } from "../src/hostgit.ts";
+import { ImportError, createGitPorts, githubSlug, makeWritable, pushArgs, readRefDirect, remoteHasBranch } from "../src/hostgit.ts";
 import type { RunClone } from "../src/hostgit.ts";
 import { fixture, fwd, git, treeHash } from "./gitfix.ts";
 import type { Fixture } from "./gitfix.ts";
@@ -436,4 +436,72 @@ test("remoteHasBranch tells a claimed branch from a free one", async () => {
   assert.equal(await remoteHasBranch(f.user, "afk/7"), false);
   git(f.user, "push", "-q", "origin", "main:refs/heads/afk/7");
   assert.equal(await remoteHasBranch(f.user, "afk/7"), true);
+});
+
+test("the delete fallback never changes a file outside the tree through a planted symlink", (t) => {
+  const outside = join(mkdtempSync(join(tmpdir(), "afk-out-")), "key");
+  writeFileSync(outside, "k");
+  chmodSync(outside, 0o400);
+  const before = lstatSync(outside).mode;
+  const dir = mkdtempSync(join(tmpdir(), "afk-tree-"));
+  mkdirSync(join(dir, "sub"));
+  try {
+    symlinkSync(outside, join(dir, "sub", "link"), "file");
+  } catch {
+    t.skip("cannot create symlinks here");
+    return;
+  }
+  makeWritable(dir);
+  assert.equal(lstatSync(outside).mode, before);
+});
+
+test("readTip refuses a config or packed-refs that is not a plain file instead of reading it", async () => {
+  const f = fixture();
+  const { run } = await started(f);
+  try {
+    const packed = join(run.commonDir, "packed-refs");
+    rmSync(packed, { force: true });
+    mkdirSync(packed);
+    await assert.rejects(run.readTip("afk/99"), /not a plain file/);
+    rmSync(packed, { recursive: true });
+    const config = join(run.commonDir, "config");
+    renameSync(config, `${config}.bak`);
+    mkdirSync(config);
+    await assert.rejects(run.readTip("afk/99"), /not a plain file/);
+    rmSync(config, { recursive: true });
+    renameSync(`${config}.bak`, config);
+  } finally {
+    await run.dispose();
+  }
+});
+
+test("a symlinked or junctioned object directory is an ImportError", async (t) => {
+  const f = fixture();
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "a.txt");
+  const objects = join(run.commonDir, "objects");
+  const moved = join(mkdtempSync(join(tmpdir(), "afk-objs-")), "objects");
+  renameSync(objects, moved);
+  try {
+    symlinkSync(moved, objects, "junction");
+  } catch {
+    renameSync(moved, objects);
+    t.skip("cannot create symlinks here");
+    await run.dispose();
+    return;
+  }
+  await assert.rejects(ports.createClean(run, "afk/7", tip), (e) => e instanceof ImportError);
+  rmSync(objects);
+  renameSync(moved, objects);
+  await run.dispose();
+});
+
+test("a relative origin URL is resolved against the user's repository", async () => {
+  const f = fixture();
+  git(f.user, "remote", "set-url", "origin", relative(f.user, f.origin));
+  const ports = createGitPorts();
+  const url = await ports.originUrl(f.user);
+  assert.equal(fwd(realpathSync(url)), fwd(realpathSync(f.origin)));
+  const run = await ports.createRunClone(url, "main", "7");
+  await run.dispose();
 });

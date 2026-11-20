@@ -27,7 +27,7 @@
 import { execFile } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { isGithubUrl } from "./git.ts";
 
 export interface ExecOptions {
@@ -149,26 +149,62 @@ export interface GitPorts {
   createClean(run: RunClone, branch: string, tip: string | null): Promise<CleanClone>;
 }
 
+/**
+ * The contents of `path` when it is a plain file of at most `max` bytes, null when nothing is
+ * there. A directory, symlink, FIFO or oversized file is refused, so reading it can neither hang nor
+ * leave the tree.
+ */
+function readPlainFile(path: string, max: number): string | null {
+  let st;
+  try {
+    st = lstatSync(path);
+  } catch {
+    return null;
+  }
+  if (!st.isFile()) throw new Error(`${path} is not a plain file`);
+  if (st.size > max) throw new Error(`${path} is larger than ${max} bytes`);
+  return readFileSync(path, "utf8");
+}
+
 /** The value of a ref read from the ref files, without running git. Rejects on a value that is not a commit id. */
 export function readRefDirect(commonDir: string, ref: string): string | null {
   let value: string | null = null;
-  const loose = join(commonDir, ref);
-  if (existsSync(loose)) {
-    if (!lstatSync(loose).isFile()) throw new Error(`${ref} is not a plain file`);
-    value = readFileSync(loose, "utf8").trim();
+  const loose = readPlainFile(join(commonDir, ref), 4096);
+  if (loose !== null) {
+    value = loose.trim();
   } else {
-    try {
-      for (const line of readFileSync(join(commonDir, "packed-refs"), "utf8").split(/\r?\n/)) {
-        const m = /^([^\s^#]+) (\S+)$/.exec(line);
-        if (m && m[2] === ref) value = m[1];
-      }
-    } catch {
-      return null;
+    const packed = readPlainFile(join(commonDir, "packed-refs"), 64 * 1024 ** 2);
+    if (packed === null) return null;
+    for (const line of packed.split(/\r?\n/)) {
+      const m = /^([^\s^#]+) (\S+)$/.exec(line);
+      if (m && m[2] === ref) value = m[1];
     }
   }
   if (value === null) return null;
   if (!HEX40.test(value)) throw new Error(`${ref} does not hold a commit id`);
   return value;
+}
+
+/**
+ * Make every directory and plain file of a tree writable, best effort. Symlinks and junctions are
+ * skipped, never followed: chmod on one changes its target, which can be any file on the host.
+ */
+export function makeWritable(dir: string): void {
+  const open = (d: string) => {
+    try {
+      chmodSync(d, 0o777);
+      for (const name of readdirSync(d)) {
+        const p = join(d, name);
+        const st = lstatSync(p);
+        if (st.isSymbolicLink()) continue;
+        if (st.isDirectory()) open(p);
+        else if (st.isFile()) chmodSync(p, 0o666);
+      }
+    } catch {
+      /* best effort */
+    }
+  };
+  open(dir);
 }
 
 /** Delete a directory tree, also when an agent made parts of it read-only. */
@@ -177,19 +213,7 @@ function forceRemove(dir: string): void {
   try {
     rm();
   } catch (e) {
-    const open = (d: string) => {
-      try {
-        chmodSync(d, 0o777);
-        for (const entry of readdirSync(d, { withFileTypes: true })) {
-          const p = join(d, entry.name);
-          if (entry.isDirectory()) open(p);
-          else chmodSync(p, 0o666);
-        }
-      } catch {
-        /* best effort */
-      }
-    };
-    open(dir);
+    makeWritable(dir);
     try {
       rm();
     } catch {
@@ -204,7 +228,13 @@ function forceRemove(dir: string): void {
  * entry, and more than `max` bytes, is refused.
  */
 function copyObjects(src: string, dst: string, max: number): void {
-  if (!existsSync(src)) throw new ImportError("the run clone has no object directory");
+  let top;
+  try {
+    top = lstatSync(src);
+  } catch {
+    throw new ImportError("the run clone has no object directory");
+  }
+  if (!top.isDirectory()) throw new ImportError(`${src} is not a directory`);
   let total = 0;
   const copyFiles = (from: string, to: string) => {
     mkdirSync(to, { recursive: true });
@@ -240,7 +270,9 @@ export function createGitPorts(
     async originUrl(repoDir) {
       const url = (await exec("git", [...hardening(), "config", "--get", "remote.origin.url"], { cwd: repoDir, env })).trim();
       if (url === "") throw new Error(`${repoDir} has no remote.origin.url`);
-      return url;
+      // A relative local path is relative to the repository; the clones run elsewhere.
+      const remoteLike = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) || /^(?:[^@\s/:]+@)?[^:/\s]{2,}:/.test(url);
+      return remoteLike || isAbsolute(url) ? url : resolve(repoDir, url);
     },
 
     async createRunClone(url, baseBranch, id) {
@@ -261,12 +293,8 @@ export function createGitPorts(
           gitDir: commonDir,
           async readTip(branch) {
             const ref = `refs/heads/${branch}`;
-            let config = "";
-            try {
-              config = readFileSync(join(commonDir, "config"), "utf8");
-            } catch {
-              /* a missing config is read as the files backend */
-            }
+            // A missing config is read as the files backend; anything but a plain file is refused.
+            const config = readPlainFile(join(commonDir, "config"), 1024 ** 2) ?? "";
             if (!/refstorage\s*=\s*reftable/i.test(config)) return readRefDirect(commonDir, ref);
             const out = await exec("git", [...hardening(), `--git-dir=${commonDir}`, "rev-parse", "--verify", "--quiet", ref], {
               cwd: neutral(),
