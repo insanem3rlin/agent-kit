@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AfkConfig } from "../src/config.ts";
 import { EnvError } from "../src/env.ts";
+import { ImportError } from "../src/hostgit.ts";
 import { IssueSetupError, SetupError, runIssue } from "../src/run.ts";
 import type { AgentRun, RunPorts, RunSandbox } from "../src/run.ts";
 import type { Backlog, BacklogIssue } from "../src/backlog/types.ts";
@@ -15,6 +16,7 @@ const BASE = "b".repeat(40);
 const TIP = "a".repeat(40);
 const SWAP = "c".repeat(40);
 const DIR = "/clean/7";
+const RUN = "/run/afk-run-7";
 
 interface Setup {
   log: string[];
@@ -37,7 +39,9 @@ interface Options {
   findings?: string | null;
   failAgent?: (r: AgentRun) => Error | undefined;
   failPush?: (n: number) => boolean;
-  tampered?: boolean;
+  importError?: boolean;
+  runCloneError?: Error;
+  originUrlError?: Error;
   tip?: string | null | Error;
   openError?: Error;
   cleanError?: Error;
@@ -53,7 +57,6 @@ function setup(o: Options = {}): Setup {
   let head = TIP;
   let pushes = 0;
   const sandbox: RunSandbox = {
-    workdir: "/work/afk-7",
     async runAgent(r) {
       s.log.push(`agent:${r.agent}:${r.model}`);
       s.agentRuns.push(r);
@@ -74,30 +77,36 @@ function setup(o: Options = {}): Setup {
   s.ports = {
     async openSandbox(opts) {
       s.log.push("open");
+      assert.equal(opts.runDir, RUN, "sandcastle runs in the run clone");
       if (o.openError) throw o.openError;
       s.opened.push(opts);
       return sandbox;
     },
     git: {
-      async ensureExcluded(dir) {
-        s.log.push(`exclude:${dir}`);
+      async originUrl() {
+        s.log.push("originUrl");
+        if (o.originUrlError) throw o.originUrlError;
+        return "https://github.com/o/r.git";
       },
-      async capture() {
-        s.log.push("capture");
-        return { baseSha: BASE, baseBranch: "main", originUrl: "https://github.com/o/r.git" } as never;
-      },
-      async restoreIfTampered() {
-        s.log.push("tamper-check");
-        return o.tampered ?? false;
-      },
-      async readTip() {
-        s.log.push("readTip");
-        if (o.tip instanceof Error) throw o.tip;
-        return o.tip === undefined ? TIP : o.tip;
+      async createRunClone(url, baseBranch) {
+        s.log.push("runclone");
+        if (o.runCloneError) throw o.runCloneError;
+        return {
+          dir: RUN, baseBranch, baseSha: BASE, originUrl: url, commonDir: RUN + "/.git", gitDir: RUN + "/.git",
+          async readTip() {
+            s.log.push("readTip");
+            if (o.tip instanceof Error) throw o.tip;
+            return o.tip === undefined ? TIP : o.tip;
+          },
+          async dispose() {
+            s.log.push("disposeRun");
+          },
+        };
       },
       async createClean(_snap, _branch, tip) {
         s.log.push(`clean:${tip}`);
         if (o.cleanError) throw o.cleanError;
+        if (o.importError && tip !== null) throw new ImportError("object 1234 is missing");
         head = tip ?? BASE;
         return {
           dir: DIR,
@@ -123,9 +132,6 @@ function setup(o: Options = {}): Setup {
             s.log.push("dispose");
           },
         };
-      },
-      async removeLocal(_dir, branch) {
-        s.log.push(`removeLocal:${branch}`);
       },
     },
     github: {
@@ -174,10 +180,10 @@ test("a ready run: implementer, reviewer, container stopped, checks, guards in t
   const out = await runIssue(input(s));
   assert.deepEqual(out, { status: "ready", branch: "afk/7", prUrl: "https://github.test/o/r/pull/9" });
   assert.deepEqual(s.log.filter((l) => !l.startsWith("read:") && !l.startsWith("rm:")), [
-    "exclude:/repo", "open", "capture", "agent:claude:sonnet", "agent:claude:opus",
-    "tamper-check", "close", "tamper-check", "readTip", `clean:${TIP}`, `inspect:${TIP}`, `push:${TIP}`,
-    "pr", "backlog:ready", "close-noop-guard", "dispose", "removeLocal:afk/7",
-  ].filter((l) => l !== "close-noop-guard"));
+    "originUrl", "runclone", "open", "agent:claude:sonnet", "agent:claude:opus",
+    "close", "readTip", `clean:${TIP}`, `inspect:${TIP}`, `push:${TIP}`,
+    "pr", "backlog:ready", "dispose", "disposeRun",
+  ]);
   assert.equal(s.opened[0].branch, "afk/7");
   assert.equal(s.opened[0].baseRef, "origin/main");
   assert.deepEqual(s.prs[0], { cwd: DIR, repo: "o/r", head: "afk/7", base: "main", title: "Add the thing", body: s.prs[0].body });
@@ -259,7 +265,7 @@ test("no commits: blocked, nothing pushed, nothing opened as a PR", async () => 
   assert.ok(!s.log.includes("pr"));
   assert.deepEqual(s.backlogCalls.map((c) => c.fn), ["blocked"]);
   assert.match(s.backlogCalls[0].text, /no commits/i);
-  assert.equal(s.log.at(-1), "removeLocal:afk/7");
+  assert.equal(s.log.at(-1), "disposeRun");
 });
 
 test("a branch without a ref is the same as no commits", async () => {
@@ -306,24 +312,60 @@ test("an unpreparable clean clone is a SetupError that marks nothing and still c
   await assert.rejects(runIssue(input(s)), SetupError);
   assert.deepEqual(s.backlogCalls, []);
   assert.ok(s.log.includes("close"));
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+  assert.ok(s.log.includes("disposeRun") === false, "the run clone is kept: the agent's work is in it");
 });
 
-test("tampered .git config or hooks: blocked with that reason, no tip read, no clone, nothing pushed (GitHub)", async () => {
-  const s = setup({ tampered: true });
-  const out = await runIssue(input(s));
-  assert.deepEqual(out, { status: "blocked", reason: "the agent modified .git configuration or hooks" });
-  assert.deepEqual(pushes(s), []);
-  assert.ok(!s.log.includes("readTip") && !s.log.some((l) => l.startsWith("clean:")) && !s.log.includes("pr"));
+test("an origin that cannot be read or cloned is a SetupError before anything starts", async () => {
+  const s = setup({ runCloneError: new Error("origin unreachable") });
+  await assert.rejects(runIssue(input(s)), SetupError);
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.includes("open"));
+  const s2 = setup({ originUrlError: new Error("no origin") });
+  await assert.rejects(runIssue(input(s2)), SetupError);
+  assert.ok(!s2.log.includes("runclone"));
 });
 
-test("an implementer that crashed still gets the tamper check and the container stop before the block", async () => {
-  const s = setup({ tampered: true, failAgent: (r) => (r.model === "sonnet" ? new Error("boom") : undefined) });
+test("a tip that cannot be imported blocks the issue (not a SetupError), pushes nothing, and still cleans up", async () => {
+  const s = setup({ importError: true });
   const out = await runIssue(input(s));
   assert.equal(out.status, "blocked");
-  assert.match(reason(out), /modified \.git/);
-  assert.ok(s.log.indexOf("tamper-check") < s.log.indexOf("close"));
-  assert.ok(s.log.indexOf("close") < s.log.indexOf("backlog:blocked"));
+  assert.match(reason(out), /cannot be imported.*object 1234 is missing/);
+  assert.deepEqual(pushes(s), []);
+  assert.ok(s.log.includes("disposeRun"));
+  assert.deepEqual(s.backlogCalls.map((c) => c.fn), ["blocked"]);
+});
+
+test("Backlog.md: a tip that cannot be imported records the block on the captured base, pushing only the swap", async () => {
+  const s = setup({ importError: true });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "blocked");
+  assert.deepEqual(s.log.filter((l) => /^(checkout|backlog|push|clean)/.test(l)), [`clean:${TIP}`, "clean:null", `checkout:${BASE}`, "backlog:blocked", `push:${SWAP}`]);
+});
+
+test("the run clone is deleted when the run is finished, and kept (path in the outcome and in the log) when the work push failed", async () => {
+  const ok = setup();
+  await runIssue(input(ok));
+  assert.ok(ok.log.includes("disposeRun"));
+  const lines: string[] = [];
+  const bad = setup({ failPush: () => true });
+  const out = await runIssue(input(bad, { log: (l) => lines.push(l) }));
+  assert.equal(out.status, "blocked");
+  assert.equal((out as { keptClone?: string }).keptClone, RUN);
+  assert.ok(!bad.log.includes("disposeRun"));
+  assert.ok(lines.some((l) => l.includes(RUN)));
+});
+
+test("a run clone that cannot be deleted does not make the run throw", async () => {
+  const s = setup();
+  const real = s.ports.git.createRunClone;
+  s.ports.git.createRunClone = async (...a) => {
+    const r = await real(...a);
+    r.dispose = async () => {
+      throw new Error("EACCES");
+    };
+    return r;
+  };
+  assert.equal((await runIssue(input(s))).status, "ready");
 });
 
 test("a branch that would be the base branch is refused before a sandbox opens", async () => {
@@ -351,14 +393,14 @@ test("a reviewer failure keeps the implementer's work and says so in the PR", as
   assert.match(s.prs[0].body, /review did not complete.*review crashed/i);
 });
 
-test("a failed push blocks (the label is swapped), keeps the local branch and does not throw", async () => {
+test("a failed push blocks (the label is swapped), keeps the run clone and does not throw", async () => {
   const s = setup({ failPush: () => true });
   const out = await runIssue(input(s));
   assert.equal(out.status, "blocked");
   assert.match(s.backlogCalls[0].text, /rejected/);
   assert.ok(!s.log.includes("pr"));
   assert.ok(s.log.includes("dispose"));
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+  assert.ok(!s.log.includes("disposeRun"));
 });
 
 test("Spec findings are posted as a PR comment on GitHub, from the clean clone", async () => {
@@ -403,7 +445,7 @@ test("every post-push step failing together still returns ready with all warning
   assert.match(w, /posting the Spec findings on the issue failed/);
   assert.match(w, /swapping the label failed: label failed/);
   assert.ok(s.log.includes("dispose"));
-  assert.ok(s.log.includes("removeLocal:afk/7"));
+  assert.ok(s.log.includes("disposeRun"));
 });
 
 test("a failing PR comment or label swap is a warning too", async () => {
@@ -424,7 +466,7 @@ test("Backlog.md: the label swap is committed in the clean clone on the pushed t
   ]);
   const ready = s.backlogCalls.find((c) => c.fn === "ready")!;
   assert.equal(ready.workdir, DIR, "the swap is committed in the clean clone, never the shared worktree");
-  assert.notEqual(ready.workdir, "/work/afk-7");
+  assert.notEqual(ready.workdir, RUN, "never the run clone either");
 });
 
 test("Backlog.md: a swap commit that touches a workflow is not pushed", async () => {
@@ -443,21 +485,15 @@ test("Backlog.md blocked: the clean clone is checked out at the captured base co
   assert.equal(s.backlogCalls[0].workdir, DIR);
 });
 
-test("Backlog.md blocked by tampering needs no agent objects: the clone has no tip", async () => {
-  const s = setup({ tampered: true });
-  await runIssue(input(s, { config: mdConfig }));
-  assert.deepEqual(s.log.filter((l) => /^(checkout|backlog|push|clean)/.test(l)), ["clean:null", `checkout:${BASE}`, "backlog:blocked", `push:${SWAP}`]);
-});
-
 test("Backlog.md: a failed push of the work records nothing, pushes nothing else and says the work stays local", async () => {
   const s = setup({ failPush: () => true });
   const out = await runIssue(input(s, { config: mdConfig }));
   assert.equal(out.status, "blocked");
   assert.equal((out as { unmarked?: boolean }).unmarked, true);
-  assert.match(reason(out), /stays in the local branch/);
+  assert.match(reason(out), /stays in the run clone/);
   assert.equal(pushes(s).length, 1);
   assert.deepEqual(s.backlogCalls, []);
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+  assert.equal((out as { keptClone?: string }).keptClone, RUN);
 });
 
 test("Backlog.md: a failed push of the blocked branch is reported unrecorded, not thrown", async () => {
@@ -465,7 +501,6 @@ test("Backlog.md: a failed push of the blocked branch is reported unrecorded, no
   const out = await runIssue(input(s, { config: mdConfig }));
   assert.equal(out.status, "blocked");
   assert.match(reason(out), /stays unrecorded/);
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
 });
 
 test("Backlog.md: a failed second push after the PR leaves a warning, not an exception", async () => {

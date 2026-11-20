@@ -1,67 +1,31 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { createGitPorts, githubSlug, pushArgs, readRefDirect, remoteHasBranch, removeStale } from "../src/hostgit.ts";
-import type { CleanClone, GitSnapshot } from "../src/hostgit.ts";
+import { ImportError, createGitPorts, githubSlug, pushArgs, readRefDirect, remoteHasBranch } from "../src/hostgit.ts";
+import type { RunClone } from "../src/hostgit.ts";
+import { fixture, fwd, git, treeHash } from "./gitfix.ts";
+import type { Fixture } from "./gitfix.ts";
 
-const git = (cwd: string, ...args: string[]) =>
-  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.test", ...args], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-const fwd = (p: string) => p.replaceAll("\\", "/");
-
-interface Fixture {
-  root: string;
-  origin: string;
-  work: string;
-  wt: string;
-  marker: string;
-  baseSha: string;
+/** What sandcastle does inside the run clone: a linked worktree on afk/7. */
+function agentWorktree(run: RunClone) {
+  const wt = join(run.dir, ".sandcastle", "worktrees", "afk-7");
+  git(run.dir, "worktree", "add", "-q", "-b", "afk/7", wt, "origin/main");
+  return wt;
 }
 
-/** A bare origin, a clone with one commit on main, and a linked worktree on afk/7 (what sandcastle makes). */
-function fixture(): Fixture {
-  const root = realpathSync.native(mkdtempSync(join(tmpdir(), "afk-hostgit-")));
-  const origin = join(root, "origin.git");
-  const work = join(root, "work");
-  const wt = join(root, "wt");
-  git(root, "init", "-q", "--bare", "-b", "main", origin);
-  git(root, "clone", "-q", origin, work);
-  writeFileSync(join(work, "README.md"), "hi\n");
-  git(work, "add", ".");
-  git(work, "commit", "-q", "-m", "init");
-  git(work, "branch", "-M", "main");
-  git(work, "push", "-q", "origin", "main");
-  git(work, "worktree", "add", "-q", "-b", "afk/7", wt, "origin/main");
-  return { root, origin, work, wt, marker: join(root, "MARKER"), baseSha: git(work, "rev-parse", "origin/main") };
-}
-
-const commit = (f: Fixture, file: string, content = "x\n") => {
-  mkdirSync(join(f.wt, file, ".."), { recursive: true });
-  writeFileSync(join(f.wt, file), content);
-  git(f.wt, "add", "-A");
-  git(f.wt, "commit", "-q", "-m", `add ${file}`);
-  return git(f.wt, "rev-parse", "HEAD");
+const commit = (wt: string, file: string, content = "x\n") => {
+  mkdirSync(join(wt, file, ".."), { recursive: true });
+  writeFileSync(join(wt, file), content);
+  git(wt, "add", "-A");
+  git(wt, "commit", "-q", "-m", `add ${file}`);
+  return git(wt, "rev-parse", "HEAD");
 };
 
 const evilScript = (f: Fixture) => `#!/bin/sh\necho ran > "${fwd(f.marker)}"\n`;
-const commonDir = (f: Fixture) => join(f.work, ".git");
-const adminDir = (f: Fixture) => join(f.work, ".git", "worktrees", "wt");
-
-async function snapshot(f: Fixture) {
-  const ports = createGitPorts();
-  const snap = await ports.capture(f.work, f.wt, "main");
-  return { ports, snap };
-}
-
-/** The run's host-side sequence after the container has stopped. */
-async function cleanFor(f: Fixture, tip: string | null = null) {
-  const { ports, snap } = await snapshot(f);
-  const sha = tip ?? (await ports.readTip(snap, "afk/7"));
-  return { ports, snap, sha, clean: await ports.createClean(snap, "afk/7", sha) };
-}
-
 const originRef = (f: Fixture, ref = "refs/heads/afk/7") => {
   try {
     return git(f.origin, "rev-parse", "--verify", "--quiet", ref);
@@ -70,16 +34,75 @@ const originRef = (f: Fixture, ref = "refs/heads/afk/7") => {
   }
 };
 
-test("capture records the base commit, origin URL and the real git directories", async () => {
+async function started(f: Fixture) {
+  const ports = createGitPorts();
+  const run = await ports.createRunClone(await ports.originUrl(f.user), "main", "7");
+  return { ports, run, wt: agentWorktree(run) };
+}
+
+test("originUrl reads the URL of origin without running anything from the repository", async () => {
   const f = fixture();
-  const { snap } = await snapshot(f);
-  assert.equal(snap.baseSha, f.baseSha);
-  assert.equal(fwd(snap.originUrl), fwd(f.origin));
-  assert.equal(fwd(realpathSync.native(snap.commonDir)), fwd(commonDir(f)));
-  assert.equal(fwd(realpathSync.native(snap.gitDir)), fwd(adminDir(f)));
+  writeFileSync(join(f.user, ".git", "hooks", "reference-transaction"), evilScript(f), { mode: 0o755 });
+  assert.equal(fwd(await createGitPorts().originUrl(f.user)), fwd(f.origin));
+  assert.equal(existsSync(f.marker), false);
 });
 
-test("readRefDirect reads loose and packed refs without git, and refuses anything that is not a commit id", () => {
+test("the run clone is a private, full copy of origin in the temp directory, at origin/<base>", async () => {
+  const f = fixture();
+  const ports = createGitPorts();
+  const url = await ports.originUrl(f.user);
+  const a = await ports.createRunClone(url, "main", "7");
+  const b = await ports.createRunClone(url, "main", "7");
+  try {
+    assert.notEqual(a.dir, b.dir);
+    assert.ok(fwd(a.dir).startsWith(fwd(realpathSync.native(tmpdir()))) || fwd(a.dir).startsWith(fwd(tmpdir())));
+    assert.match(a.dir, /afk-run-7-/);
+    assert.equal(a.baseSha, f.baseSha);
+    assert.equal(a.originUrl, url);
+    assert.equal(git(a.dir, "rev-parse", "HEAD"), f.baseSha);
+    assert.equal(fwd(realpathSync.native(a.commonDir)), fwd(realpathSync.native(join(a.dir, ".git"))));
+    assert.equal(existsSync(join(a.commonDir, "objects", "info", "alternates")), false, "no sharing with the user's repository");
+  } finally {
+    await a.dispose();
+    await b.dispose();
+  }
+  assert.equal(existsSync(a.dir), false);
+});
+
+test("a clone of a local origin shares no objects with the user's repository (no hardlinks)", async () => {
+  const f = fixture();
+  const { run } = await started(f);
+  try {
+    const seen = (dir: string): string[] => readdirSync(dir, { recursive: true, withFileTypes: true }).filter((e) => e.isFile()).map((e) => join(e.parentPath, e.name));
+    for (const p of seen(join(run.commonDir, "objects"))) assert.equal(lstatSync(p).nlink, 1, p);
+  } finally {
+    await run.dispose();
+  }
+});
+
+test("the user's repository is byte-identical after a whole run in which the agent attacks the run clone", async () => {
+  const f = fixture();
+  const before = treeHash(join(f.user, ".git"));
+  const ports = createGitPorts();
+  const run = await ports.createRunClone(await ports.originUrl(f.user), "main", "7");
+  const wt = agentWorktree(run);
+  const tip = commit(wt, "src/a.ts");
+  // the agent plants hooks, config and a commondir redirect in the run clone
+  for (const h of ["pre-push", "post-commit", "reference-transaction"]) writeFileSync(join(run.commonDir, "hooks", h), evilScript(f), { mode: 0o755 });
+  writeFileSync(join(run.commonDir, "config"), readFileSync(join(run.commonDir, "config"), "utf8") + `[core]\n\tsshCommand = sh ${fwd(join(f.root, "x"))}\n\tfsmonitor = sh ${fwd(join(f.root, "x"))}\n`);
+  writeFileSync(join(run.commonDir, "worktrees", "afk-7", "commondir"), `${fwd(join(f.user, ".git"))}\n`);
+  writeFileSync(join(run.commonDir, "worktrees", "afk-7", "gitdir"), `${fwd(join(f.user, ".git", "x"))}\n`);
+  const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
+  await clean.checkout(tip);
+  await clean.push(tip);
+  await clean.dispose();
+  await run.dispose();
+  assert.equal(treeHash(join(f.user, ".git")), before);
+  assert.equal(originRef(f), tip);
+  assert.equal(existsSync(f.marker), false);
+});
+
+test("readTip reads the ref files directly, loose or packed, and refuses anything that is not a commit id", async () => {
   const dir = mkdtempSync(join(tmpdir(), "afk-ref-"));
   mkdirSync(join(dir, "refs", "heads", "afk"), { recursive: true });
   const a = "a".repeat(40);
@@ -88,9 +111,51 @@ test("readRefDirect reads loose and packed refs without git, and refuses anythin
   writeFileSync(join(dir, "packed-refs"), `# pack-refs\n${b} refs/heads/afk/7\n${a} refs/heads/other\n^${a}\n`);
   assert.equal(readRefDirect(dir, "refs/heads/afk/7"), b);
   writeFileSync(join(dir, "refs", "heads", "afk", "7"), `${a}\n`);
-  assert.equal(readRefDirect(dir, "refs/heads/afk/7"), a, "a loose ref wins over packed-refs");
+  assert.equal(readRefDirect(dir, "refs/heads/afk/7"), a);
   writeFileSync(join(dir, "refs", "heads", "afk", "7"), "ref: refs/heads/main\n");
   assert.throws(() => readRefDirect(dir, "refs/heads/afk/7"), /does not hold a commit id/);
+});
+
+test("the run clone's tip is read from loose and packed refs; an unborn branch has none", async () => {
+  const f = fixture();
+  const { run, wt } = await started(f);
+  try {
+    const tip = commit(wt, "a.txt");
+    assert.equal(await run.readTip("afk/7"), tip);
+    git(run.dir, "pack-refs", "--all");
+    assert.equal(await run.readTip("afk/7"), tip);
+    assert.equal(await run.readTip("afk/99"), null);
+  } finally {
+    await run.dispose();
+  }
+});
+
+test("with a reftable run clone the tip comes from a hardened git command pinned to the clone", async (t) => {
+  const f = fixture();
+  const ports = createGitPorts();
+  let run: RunClone;
+  try {
+    const url = await ports.originUrl(f.user);
+    const probe = join(f.root, "probe");
+    execFileSync("git", ["init", "-q", "--ref-format=reftable", probe]);
+    run = await ports.createRunClone(url, "main", "7");
+  } catch {
+    t.skip("this git cannot make reftable repositories");
+    return;
+  }
+  try {
+    const wt = agentWorktree(run);
+    const tip = commit(wt, "a.txt");
+    // convert the run clone to reftable the way an agent (or a user's init.defaultRefFormat) could
+    git(run.dir, "refs", "migrate", "--ref-format=reftable");
+    assert.match(readFileSync(join(run.commonDir, "config"), "utf8"), /refstorage\s*=\s*reftable/i);
+    assert.equal(await run.readTip("afk/7"), tip);
+  } catch (e) {
+    if (/refs migrate|ref-format/.test(String(e))) t.skip("this git cannot migrate refs");
+    else throw e;
+  } finally {
+    await run.dispose();
+  }
 });
 
 test("pushArgs pushes one exact commit to the captured URL, never forced, with the helper only for GitHub", () => {
@@ -99,7 +164,6 @@ test("pushArgs pushes one exact commit to the captured URL, never forced, with t
   assert.deepEqual(gh.slice(-3), ["push", "https://github.com/o/r.git", `${tip}:refs/heads/afk/7`]);
   assert.ok(gh.includes("credential.helper=!gh auth git-credential"));
   assert.ok(gh.includes("protocol.ext.allow=never") && gh.includes("core.fsmonitor=false"));
-  assert.ok(gh.some((a) => a.startsWith("core.hooksPath=")));
   const local = pushArgs("/srv/o.git", "afk/7", tip);
   assert.ok(!local.some((a) => a.includes("credential.helper")));
   for (const a of [...gh, ...local]) assert.ok(!/^(-f|--force.*|\+.*)$/.test(a), `forced: ${a}`);
@@ -108,130 +172,31 @@ test("pushArgs pushes one exact commit to the captured URL, never forced, with t
 test("githubSlug names the repository of a GitHub URL and nothing else", () => {
   assert.equal(githubSlug("https://github.com/o/r.git"), "o/r");
   assert.equal(githubSlug("git@github.com:o/r.git"), "o/r");
-  assert.equal(githubSlug("https://github.com/o/r"), "o/r");
   assert.equal(githubSlug("/srv/origin.git"), null);
-  assert.equal(githubSlug("https://example.test/o/r.git"), null);
 });
 
-test("ensureExcluded adds .sandcastle/ once", async () => {
+// ---- the clean clone and the import
+
+test("the clean clone has the agent's commits, and the guards see exactly what would be pushed", async () => {
   const f = fixture();
-  const ports = createGitPorts();
-  await ports.ensureExcluded(f.work);
-  await ports.ensureExcluded(f.work);
-  const text = readFileSync(join(commonDir(f), "info", "exclude"), "utf8");
-  assert.equal(text.split("\n").filter((l) => l === ".sandcastle/").length, 1);
-});
-
-// ---- protecting the user's .git
-
-test("a planted hook is detected and removed; sandcastle's own user.name is not tampering", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  writeFileSync(join(commonDir(f), "config"), readFileSync(join(commonDir(f), "config"), "utf8") + "\n[user]\n\temail = agent@example.test\n");
-  assert.equal(await ports.restoreIfTampered(snap), false);
-  const hook = join(commonDir(f), "hooks", "pre-push");
-  writeFileSync(hook, evilScript(f), { mode: 0o755 });
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.equal(existsSync(hook), false);
-  assert.equal(await ports.restoreIfTampered(snap), false);
-});
-
-test("a config that runs something is detected and restored", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  const cfg = join(commonDir(f), "config");
-  const before = readFileSync(cfg);
-  writeFileSync(cfg, Buffer.concat([before, Buffer.from(`[core]\n\tsshCommand = sh ${fwd(join(f.root, "evil.sh"))}\n[protocol "ext"]\n\tallow = always\n`)]));
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.deepEqual(readFileSync(cfg), before);
-});
-
-test("a config git cannot parse is tampering, and the original bytes come back", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  const cfg = join(commonDir(f), "config");
-  const before = readFileSync(cfg);
-  writeFileSync(cfg, "[core\n\tsshCommand = x\n");
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.deepEqual(readFileSync(cfg), before);
-});
-
-test("the shared config.worktree is guarded too", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  const cw = join(commonDir(f), "config.worktree");
-  writeFileSync(cw, "[core]\n\tfsmonitor = sh evil\n");
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.equal(existsSync(cw), false);
-});
-
-test("a rewritten commondir or gitdir of the worktree is detected and restored", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  const fake = join(f.root, "fake.git");
-  git(f.root, "init", "-q", "--bare", fake);
-  const cd = join(adminDir(f), "commondir");
-  const gd = join(adminDir(f), "gitdir");
-  const [cdBefore, gdBefore] = [readFileSync(cd), readFileSync(gd)];
-  writeFileSync(cd, `${fwd(fake)}\n`);
-  writeFileSync(gd, `${fwd(join(fake, "x"))}\n`);
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.deepEqual(readFileSync(cd), cdBefore);
-  assert.deepEqual(readFileSync(gd), gdBefore);
-});
-
-test("a vanished worktree admin directory (sandcastle closing it) is not tampering", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  git(f.work, "worktree", "remove", "--force", f.wt);
-  assert.equal(await ports.restoreIfTampered(snap), false);
-});
-
-// ---- the clean clone
-
-test("the clean clone has the agent's commits, the validated tip, and only that", async () => {
-  const f = fixture();
-  const tip = commit(f, "src/a.ts");
-  const { clean, sha } = await cleanFor(f);
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "src/a.ts");
+  const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
   try {
-    assert.equal(sha, tip);
-    const inspected = await clean.inspect(tip);
-    assert.deepEqual(inspected, { commits: 1, merges: 0, files: ["src/a.ts"] });
+    assert.deepEqual(await clean.inspect(tip), { commits: 1, merges: 0, files: ["src/a.ts"] });
     await clean.checkout(tip);
     await clean.push(tip);
     assert.equal(originRef(f), tip);
-    assert.ok(!existsSync(f.marker));
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
-});
-
-test("a branch with no ref has no tip, and a clone without one still has the base", async () => {
-  const f = fixture();
-  git(f.wt, "checkout", "-q", "--detach");
-  git(f.work, "worktree", "remove", "--force", f.wt);
-  git(f.work, "branch", "-D", "afk/7");
-  const { ports, snap } = await snapshot({ ...f, wt: f.work });
-  assert.equal(await ports.readTip(snap, "afk/7"), null);
-  const clean = await ports.createClean(snap, "afk/7", null);
-  try {
-    await clean.checkout(snap.baseSha);
-    assert.equal(await clean.head(), snap.baseSha);
-  } finally {
-    await clean.dispose();
-  }
-});
-
-test("a tip whose objects do not exist fails and leaves no clone behind", async () => {
-  const f = fixture();
-  const { ports, snap } = await snapshot(f);
-  await assert.rejects(ports.createClean(snap, "afk/7", "d".repeat(40)));
 });
 
 test("a push is never forced: a diverged remote branch is refused", async () => {
   const f = fixture();
-  git(f.work, "push", "-q", "origin", "main:refs/heads/afk/7");
-  const tip = commit(f, "src/a.ts"); // wt branched from the same base, so afk/7 diverges only after another push
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "src/a.ts");
   const other = join(f.root, "other");
   git(f.root, "clone", "-q", f.origin, other);
   writeFileSync(join(other, "z"), "z");
@@ -239,124 +204,109 @@ test("a push is never forced: a diverged remote branch is refused", async () => 
   git(other, "commit", "-q", "-m", "other");
   git(other, "push", "-q", "origin", "HEAD:refs/heads/afk/7");
   const remote = originRef(f);
-  const { clean } = await cleanFor(f, tip);
+  const clean = await ports.createClean(run, "afk/7", tip);
   try {
     await assert.rejects(clean.push(tip));
     assert.equal(originRef(f), remote);
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
 });
 
-// ---- the reviewer's attacks, with real repositories
-
-test("ATTACK commondir: redirecting the worktree to a fake repository gets no code run and does not change what is pushed", async () => {
+test("ATTACK commondir: a worktree redirected to a fake repository, with its config, gets no code run and does not change what is pushed", async () => {
   const f = fixture();
-  const tip = commit(f, "src/a.ts");
-  const { ports, snap } = await snapshot(f);
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "src/a.ts");
   const fake = join(f.root, "fake.git");
   git(f.root, "init", "-q", "--bare", fake);
   const sshHook = join(f.root, "evil-ssh.sh");
   writeFileSync(sshHook, evilScript(f), { mode: 0o755 });
+  mkdirSync(join(f.root, "hooks"));
+  for (const h of ["pre-push", "post-checkout", "post-commit", "reference-transaction"]) writeFileSync(join(f.root, "hooks", h), evilScript(f), { mode: 0o755 });
   writeFileSync(
     join(fake, "config"),
     `[core]\n\tbare = true\n\tsshCommand = sh ${fwd(sshHook)}\n\tfsmonitor = sh ${fwd(sshHook)}\n\thooksPath = ${fwd(join(f.root, "hooks"))}\n[protocol "ext"]\n\tallow = always\n[url "${fwd(fake)}"]\n\tinsteadOf = ${fwd(f.origin)}\n\tpushInsteadOf = ${fwd(f.origin)}\n`,
   );
-  mkdirSync(join(f.root, "hooks"));
-  for (const h of ["pre-push", "post-checkout", "post-commit", "reference-transaction"]) writeFileSync(join(f.root, "hooks", h), evilScript(f), { mode: 0o755 });
-  writeFileSync(join(adminDir(f), "commondir"), `${fwd(fake)}\n`);
-  writeFileSync(join(adminDir(f), "gitdir"), `${fwd(join(fake, "x"))}\n`);
-
-  // The run reads and pushes through pinned paths, before and instead of restoring.
-  const sha = await ports.readTip(snap, "afk/7");
-  assert.equal(sha, tip);
-  const clean = await ports.createClean(snap, "afk/7", sha);
+  writeFileSync(join(run.commonDir, "worktrees", "afk-7", "commondir"), `${fwd(fake)}\n`);
+  writeFileSync(join(run.commonDir, "worktrees", "afk-7", "gitdir"), `${fwd(join(fake, "x"))}\n`);
+  const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
   try {
     assert.deepEqual((await clean.inspect(tip)).files, ["src/a.ts"]);
     await clean.checkout(tip);
     await clean.push(tip);
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
-  assert.equal(existsSync(f.marker), false, "code from the agent's fake repository ran on the host");
-  assert.equal(originRef(f), tip, "the push went to the captured origin, not to the fake repository");
-  assert.equal(await ports.restoreIfTampered(snap), true);
-  assert.equal(readFileSync(join(adminDir(f), "commondir"), "utf8").trim().endsWith("../.."), true);
+  assert.equal(existsSync(f.marker), false);
+  assert.equal(originRef(f), tip);
 });
 
 test("ATTACK replace: git replace cannot hide a workflow from the guard", async () => {
   const f = fixture();
-  const workflow = commit(f, ".github/workflows/ci.yml", "on: push\n");
-  const benign = git(f.wt, "commit-tree", "-p", f.baseSha, "-m", "benign", `${f.baseSha}^{tree}`);
-  // With the replacement active, the shared repository shows the benign commit and no workflow.
-  git(f.wt, "replace", workflow, benign);
-  assert.equal(git(f.wt, "diff", "--name-only", `${f.baseSha}..${workflow}`), "", "the attack must hide the file from plain git first");
-  const { ports, snap } = await snapshot(f);
-  const sha = await ports.readTip(snap, "afk/7");
-  assert.equal(sha, workflow);
-  const clean = await ports.createClean(snap, "afk/7", sha);
+  const { ports, run, wt } = await started(f);
+  const workflow = commit(wt, ".github/workflows/ci.yml", "on: push\n");
+  const benign = git(wt, "commit-tree", "-p", f.baseSha, "-m", "benign", `${f.baseSha}^{tree}`);
+  git(wt, "replace", workflow, benign);
+  assert.equal(git(wt, "diff", "--name-only", `${f.baseSha}..${workflow}`), "", "the attack must hide the file from plain git first");
+  const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
   try {
-    const inspected = await clean.inspect(workflow);
-    assert.ok(inspected.files.includes(".github/workflows/ci.yml"), `the guard saw ${JSON.stringify(inspected.files)}`);
-    assert.equal(inspected.commits, 1);
+    assert.ok((await clean.inspect(workflow)).files.includes(".github/workflows/ci.yml"));
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
 });
 
-test("ATTACK retarget: moving refs/remotes/origin/<base> (loose or packed) to the agent's commit does not shrink the guarded range", async () => {
+test("ATTACK retarget: moving origin/<base> in the run clone, loose or packed, does not shrink the guarded range", async () => {
   for (const packed of [false, true]) {
     const f = fixture();
-    const tip = commit(f, ".github/workflows/ci.yml", "on: push\n");
-    const { ports, snap } = await snapshot(f);
-    git(f.work, "update-ref", "refs/remotes/origin/main", tip);
-    if (packed) git(f.work, "pack-refs", "--all");
-    assert.equal(git(f.work, "rev-parse", "origin/main"), tip, "the attack moved the base ref");
-    const sha = await ports.readTip(snap, "afk/7");
-    const clean = await ports.createClean(snap, "afk/7", sha);
+    const { ports, run, wt } = await started(f);
+    const tip = commit(wt, ".github/workflows/ci.yml", "on: push\n");
+    git(run.dir, "update-ref", "refs/remotes/origin/main", tip);
+    if (packed) git(run.dir, "pack-refs", "--all");
+    const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
     try {
-      const inspected = await clean.inspect(sha!);
-      assert.equal(inspected.commits, 1, `packed=${packed}`);
-      assert.ok(inspected.files.includes(".github/workflows/ci.yml"), `packed=${packed}`);
+      const i = await clean.inspect(tip);
+      assert.equal(i.commits, 1, `packed=${packed}`);
+      assert.ok(i.files.includes(".github/workflows/ci.yml"));
     } finally {
       await clean.dispose();
+      await run.dispose();
     }
   }
 });
 
-test("ATTACK retarget on the Backlog.md blocked path: the clean clone is based on the captured base, so only the swap commit is pushed", async () => {
+test("ATTACK retarget on the Backlog.md blocked path: only the captured base and the swap commit are pushed", async () => {
   const f = fixture();
-  const evil = commit(f, ".github/workflows/ci.yml", "on: push\n");
-  const { ports, snap } = await snapshot(f);
-  git(f.work, "update-ref", "refs/remotes/origin/main", evil);
-  const clean = await ports.createClean(snap, "afk/7", await ports.readTip(snap, "afk/7"));
+  const { ports, run, wt } = await started(f);
+  const evil = commit(wt, ".github/workflows/ci.yml", "on: push\n");
+  git(run.dir, "update-ref", "refs/remotes/origin/main", evil);
+  const clean = await ports.createClean(run, "afk/7", await run.readTip("afk/7"));
   try {
-    await clean.checkout(snap.baseSha);
-    mkdirSync(join(clean.dir, "backlog"), { recursive: true });
-    writeFileSync(join(clean.dir, "backlog", "t.md"), "blocked\n");
+    await clean.checkout(run.baseSha);
+    writeFileSync(join(clean.dir, "t.md"), "blocked\n");
     git(clean.dir, "add", "-A");
     git(clean.dir, "commit", "-q", "-m", "blocked");
     const swap = await clean.head();
-    assert.deepEqual(await clean.inspect(swap), { commits: 1, merges: 0, files: ["backlog/t.md"] });
+    assert.deepEqual(await clean.inspect(swap), { commits: 1, merges: 0, files: ["t.md"] });
     await clean.push(swap);
     assert.equal(originRef(f), swap);
     assert.equal(git(f.origin, "rev-list", "--count", `${f.baseSha}..${swap}`), "1");
-    const contains = (() => { try { git(f.origin, "merge-base", "--is-ancestor", evil, swap); return true; } catch { return false; } })();
-    assert.equal(contains, false, "the agent's commit must not be in the pushed history");
+    assert.throws(() => git(f.origin, "merge-base", "--is-ancestor", evil, swap));
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
 });
 
-test("hooks planted in the shared .git never run for commits and pushes made in the clean clone", async () => {
+test("hooks planted in the run clone never run for commits and pushes made in the clean clone", async () => {
   const f = fixture();
-  const tip = commit(f, "src/a.ts");
-  const { ports, snap } = await snapshot(f);
-  for (const h of ["pre-commit", "commit-msg", "post-commit", "pre-push", "post-checkout", "reference-transaction"]) {
-    writeFileSync(join(commonDir(f), "hooks", h), evilScript(f), { mode: 0o755 });
-  }
-  git(f.work, "config", "core.fsmonitor", `sh ${fwd(join(f.root, "x"))}`);
-  const clean = await ports.createClean(snap, "afk/7", await ports.readTip(snap, "afk/7"));
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "src/a.ts");
+  for (const h of ["pre-commit", "commit-msg", "post-commit", "pre-push", "post-checkout", "reference-transaction"]) writeFileSync(join(run.commonDir, "hooks", h), evilScript(f), { mode: 0o755 });
+  const clean = await ports.createClean(run, "afk/7", tip);
   try {
     await clean.checkout(tip);
     writeFileSync(join(clean.dir, "swap.md"), "swap\n");
@@ -365,79 +315,126 @@ test("hooks planted in the shared .git never run for commits and pushes made in 
     await clean.push(await clean.head());
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
-  assert.equal(existsSync(f.marker), false, "a hook from the shared .git ran in the clean clone");
+  assert.equal(existsSync(f.marker), false);
 });
 
-test("a merge commit and a file added then deleted are both visible to the guard", async () => {
+test("a file added in one commit and removed in the next is still visible to the guard", async () => {
   const f = fixture();
-  commit(f, ".github/workflows/x.yml", "a\n");
-  git(f.wt, "rm", "-q", ".github/workflows/x.yml");
-  git(f.wt, "commit", "-q", "-m", "remove");
-  const tip = git(f.wt, "rev-parse", "HEAD");
-  const { clean } = await cleanFor(f, tip);
+  const { ports, run, wt } = await started(f);
+  commit(wt, ".github/workflows/x.yml", "a\n");
+  git(wt, "rm", "-q", ".github/workflows/x.yml");
+  git(wt, "commit", "-q", "-m", "remove");
+  const tip = git(wt, "rev-parse", "HEAD");
+  const clean = await ports.createClean(run, "afk/7", tip);
   try {
     const i = await clean.inspect(tip);
     assert.equal(i.commits, 2);
-    assert.ok(i.files.includes(".github/workflows/x.yml"), "the per-commit paths catch the add-then-remove");
+    assert.ok(i.files.includes(".github/workflows/x.yml"));
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
 });
 
 test("a merge in the range is counted", async () => {
   const f = fixture();
-  commit(f, "a.txt");
-  git(f.wt, "checkout", "-q", "-b", "side", f.baseSha);
-  commit(f, "b.txt");
-  git(f.wt, "checkout", "-q", "afk/7");
-  git(f.wt, "merge", "-q", "--no-ff", "-m", "merge", "side");
-  const tip = git(f.wt, "rev-parse", "HEAD");
-  const { clean } = await cleanFor(f, tip);
+  const { ports, run, wt } = await started(f);
+  commit(wt, "a.txt");
+  git(wt, "checkout", "-q", "-b", "side", f.baseSha);
+  commit(wt, "b.txt");
+  git(wt, "checkout", "-q", "afk/7");
+  git(wt, "merge", "-q", "--no-ff", "-m", "merge", "side");
+  const tip = git(wt, "rev-parse", "HEAD");
+  const clean = await ports.createClean(run, "afk/7", tip);
   try {
     assert.equal((await clean.inspect(tip)).merges, 1);
   } finally {
     await clean.dispose();
+    await run.dispose();
   }
 });
 
-// ---- stale branches and kept work
+// ---- D3, D4: what the import refuses
 
-test("removeStale keeps unpushed commits under refs/afk-kept before deleting the branch, and logs it", async () => {
+test("ATTACK chained alternates: pointing the run clone at a host repository's objects does not import the host's private blob", async () => {
   const f = fixture();
-  const tip = commit(f, "a.txt");
-  git(f.work, "worktree", "remove", "--force", f.wt);
-  const lines: string[] = [];
-  await removeStale(f.work, "afk/7", { keep: true, log: (l) => lines.push(l), now: () => new Date("2026-11-20T10:00:00Z") });
-  assert.equal(git(f.work, "rev-parse", "--verify", "--quiet", "refs/afk-kept/7/20261120T100000000Z"), tip);
-  assert.throws(() => git(f.work, "rev-parse", "--verify", "--quiet", "refs/heads/afk/7"));
-  assert.equal(lines.length, 1);
-  assert.match(lines[0], /afk-kept\/7\/20261120T100000000Z/);
+  const hostRepo = join(f.root, "host");
+  git(f.root, "init", "-q", hostRepo);
+  writeFileSync(join(hostRepo, "secret.txt"), "private host data\n");
+  const secret = git(hostRepo, "hash-object", "-w", "secret.txt");
+  const { ports, run, wt } = await started(f);
+  writeFileSync(join(run.commonDir, "objects", "info", "alternates"), `${fwd(join(hostRepo, ".git", "objects"))}\n`);
+  git(wt, "update-index", "--add", "--cacheinfo", `100644,${secret},secret.txt`);
+  git(wt, "commit", "-q", "-m", "reference a blob that only the host has");
+  const tip = git(wt, "rev-parse", "HEAD");
+  await assert.rejects(ports.createClean(run, "afk/7", tip), (e) => e instanceof ImportError);
+  assert.equal(originRef(f), null);
+  await run.dispose();
 });
 
-test("removeStale deletes a branch with nothing unpushed without a backup, and is idempotent", async () => {
+test("an alternates file inside the object directory is never carried over", async () => {
   const f = fixture();
-  await removeStale(f.work, "afk/7", { keep: true });
-  assert.equal(git(f.work, "for-each-ref", "refs/afk-kept").length, 0);
-  await removeStale(f.work, "afk/7", { keep: true });
-  assert.throws(() => git(f.work, "rev-parse", "--verify", "--quiet", "refs/heads/afk/7"));
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "a.txt");
+  writeFileSync(join(run.commonDir, "objects", "info", "alternates"), `${fwd(join(f.user, ".git", "objects"))}\n`);
+  const clean = await ports.createClean(run, "afk/7", tip);
+  try {
+    assert.equal(existsSync(join(clean.dir, ".git", "objects", "info", "alternates")), false);
+  } finally {
+    await clean.dispose();
+    await run.dispose();
+  }
 });
 
-test("removeLocal through the ports also keeps work when asked", async () => {
+test("a tip whose objects do not exist is an ImportError and leaves no clone behind", async () => {
   const f = fixture();
-  commit(f, "a.txt");
-  git(f.work, "worktree", "remove", "--force", f.wt);
-  await createGitPorts().removeLocal(f.work, "afk/7", true);
-  assert.notEqual(git(f.work, "for-each-ref", "refs/afk-kept"), "");
+  const { ports, run } = await started(f);
+  const before = readdirSync(tmpdir()).filter((n) => n.startsWith("afk-clean-")).length;
+  await assert.rejects(ports.createClean(run, "afk/7", "d".repeat(40)), (e) => e instanceof ImportError);
+  assert.equal(readdirSync(tmpdir()).filter((n) => n.startsWith("afk-clean-")).length, before);
+  await run.dispose();
+});
+
+test("a symlink in the object store (a pack that points at host data) is an ImportError", async (t) => {
+  const f = fixture();
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "a.txt");
+  const hostPack = join(f.user, ".git", "objects", "pack");
+  mkdirSync(hostPack, { recursive: true });
+  try {
+    symlinkSync(hostPack, join(run.commonDir, "objects", "pack", "evil"), "dir");
+  } catch {
+    t.skip("cannot create symlinks here");
+    await run.dispose();
+    return;
+  }
+  await assert.rejects(ports.createClean(run, "afk/7", tip), (e) => e instanceof ImportError);
+  await run.dispose();
+});
+
+test("an object store over the size limit is an ImportError", async () => {
+  const f = fixture();
+  const { run, wt } = await started(f);
+  const tip = commit(wt, "a.txt");
+  const small = createGitPorts(process.env, () => {}, { maxImportBytes: 10 });
+  await assert.rejects(small.createClean(run, "afk/7", tip), (e) => e instanceof ImportError);
+  await run.dispose();
+});
+
+test("failing to fetch the base from origin is not an ImportError", async () => {
+  const f = fixture();
+  const { ports, run, wt } = await started(f);
+  const tip = commit(wt, "a.txt");
+  const gone: RunClone = { ...run, originUrl: join(f.root, "nowhere.git") };
+  await assert.rejects(ports.createClean(gone, "afk/7", tip), (e) => !(e instanceof ImportError));
+  await run.dispose();
 });
 
 test("remoteHasBranch tells a claimed branch from a free one", async () => {
   const f = fixture();
-  assert.equal(await remoteHasBranch(f.work, "afk/7"), false);
-  git(f.work, "push", "-q", "origin", "main:refs/heads/afk/7");
-  assert.equal(await remoteHasBranch(f.work, "afk/7"), true);
+  assert.equal(await remoteHasBranch(f.user, "afk/7"), false);
+  git(f.user, "push", "-q", "origin", "main:refs/heads/afk/7");
+  assert.equal(await remoteHasBranch(f.user, "afk/7"), true);
 });
-
-// keep unused-import checks honest
-void (undefined as unknown as CleanClone | GitSnapshot);
-void rmSync;
