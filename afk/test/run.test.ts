@@ -11,11 +11,16 @@ const config: AfkConfig = { backlog: "github", label: "afk", baseBranch: "main",
 const env = { GH_TOKEN: "gh-token", ANTHROPIC_API_KEY: "a-key", OPENAI_API_KEY: "o-key", CURSOR_API_KEY: "c-key" }; // leak-check: allow
 const mdConfig = { ...config, backlog: "backlog-md" as const };
 
+const BASE = "b".repeat(40);
+const TIP = "a".repeat(40);
+const SWAP = "c".repeat(40);
+const DIR = "/clean/7";
+
 interface Setup {
   log: string[];
   agentRuns: AgentRun[];
   opened: { branch: string; baseRef: string; env: Record<string, string> }[];
-  prs: { repoDir: string; head: string; base: string; title: string; body: string }[];
+  prs: { cwd: string; repo: string; head: string; base: string; title: string; body: string }[];
   prComments: string[];
   backlogCalls: { fn: string; id: string; text: string; workdir?: string; hasCtx: boolean }[];
   ports: RunPorts;
@@ -27,17 +32,25 @@ interface Options {
   commits?: number;
   merges?: number;
   changed?: string[];
+  /** files reported for the label-swap commit */
+  swapChanged?: string[];
   findings?: string | null;
   failAgent?: (r: AgentRun) => Error | undefined;
   failPush?: (n: number) => boolean;
   tampered?: boolean;
-  resolveError?: string;
+  tip?: string | null | Error;
   openError?: Error;
+  cleanError?: Error;
+  inspectError?: boolean;
+  failPr?: boolean;
+  failPrComment?: boolean;
+  failMarkReady?: boolean;
+  failIssueComment?: boolean;
 }
 
 function setup(o: Options = {}): Setup {
   const s = { log: [], agentRuns: [], opened: [], prs: [], prComments: [], backlogCalls: [] } as unknown as Setup;
-  let resolves = 0;
+  let head = TIP;
   let pushes = 0;
   const sandbox: RunSandbox = {
     workdir: "/work/afk-7",
@@ -69,31 +82,47 @@ function setup(o: Options = {}): Setup {
       async ensureExcluded(dir) {
         s.log.push(`exclude:${dir}`);
       },
-      async snapshot() {
-        s.log.push("snapshot");
-        return { snap: true } as never;
+      async capture() {
+        s.log.push("capture");
+        return { baseSha: BASE, baseBranch: "main", originUrl: "https://github.com/o/r.git" } as never;
       },
       async restoreIfTampered() {
         s.log.push("tamper-check");
         return o.tampered ?? false;
       },
-      async resolve() {
-        s.log.push("resolve");
-        resolves++;
-        if (o.resolveError) return { error: o.resolveError };
-        return { base: "B0", tip: `T${resolves}` };
+      async readTip() {
+        s.log.push("readTip");
+        if (o.tip instanceof Error) throw o.tip;
+        return o.tip === undefined ? TIP : o.tip;
       },
-      async inspect() {
-        s.log.push("inspect");
-        return { commits: o.commits ?? 2, merges: o.merges ?? 0, files: o.changed ?? ["src/a.ts"] };
-      },
-      async resetBranch(_w, branch, baseRef) {
-        s.log.push(`reset:${branch}@${baseRef}`);
-      },
-      async push(_w, _snap, branch, tip) {
-        pushes++;
-        s.log.push(`push:${branch}@${tip}`);
-        if (o.failPush?.(pushes)) throw new Error("rejected");
+      async createClean(_snap, _branch, tip) {
+        s.log.push(`clean:${tip}`);
+        if (o.cleanError) throw o.cleanError;
+        head = tip ?? BASE;
+        return {
+          dir: DIR,
+          async inspect(sha) {
+            s.log.push(`inspect:${sha}`);
+            if (o.inspectError) throw new Error("bad object");
+            if (sha === SWAP) return { commits: 3, merges: 0, files: o.swapChanged ?? ["backlog/tasks/t.md"] };
+            return { commits: o.commits ?? 2, merges: o.merges ?? 0, files: o.changed ?? ["src/a.ts"] };
+          },
+          async checkout(sha) {
+            s.log.push(`checkout:${sha}`);
+            head = sha;
+          },
+          async head() {
+            return head;
+          },
+          async push(sha) {
+            pushes++;
+            s.log.push(`push:${sha}`);
+            if (o.failPush?.(pushes)) throw new Error("rejected");
+          },
+          async dispose() {
+            s.log.push("dispose");
+          },
+        };
       },
       async removeLocal(_dir, branch) {
         s.log.push(`removeLocal:${branch}`);
@@ -102,12 +131,14 @@ function setup(o: Options = {}): Setup {
     github: {
       async createDraftPr(a) {
         s.log.push("pr");
+        if (o.failPr) throw new Error("gh exploded");
         s.prs.push(a);
         return "https://github.test/o/r/pull/9";
       },
-      async commentOnPr(_r, url, body) {
-        s.log.push(`prcomment:${url}`);
-        s.prComments.push(body);
+      async commentOnPr(a) {
+        s.log.push(`prcomment:${a.prUrl}`);
+        if (o.failPrComment) throw new Error("comment failed");
+        s.prComments.push(a.body);
       },
     },
     readText: (p) => o.files?.[p.replaceAll("\\", "/")] ?? (p.endsWith("implement.md") || p.endsWith("review.md") ? `DEFAULT ${p.split(/[\\/]/).pop()} {{ISSUE_BODY}} {{FINDINGS_FILE}}` : null),
@@ -115,6 +146,8 @@ function setup(o: Options = {}): Setup {
   const rec = (fn: string) => async (id: string, text: string, ctx?: { workdir?: string }) => {
     s.log.push(`backlog:${fn}`);
     s.backlogCalls.push({ fn, id, text, workdir: ctx?.workdir, hasCtx: ctx !== undefined });
+    if (fn === "ready" && o.failMarkReady) throw new Error("label failed");
+    if (ctx?.workdir === DIR) head = SWAP; // the Backlog.md swap is a commit in the clean clone
   };
   s.backlog = {
     listReady: async () => [],
@@ -123,6 +156,7 @@ function setup(o: Options = {}): Setup {
     markBlocked: rec("blocked"),
     comment: async (id, body) => {
       s.log.push("backlog:comment");
+      if (o.failIssueComment) throw new Error("comment failed");
       s.backlogCalls.push({ fn: "comment", id, text: body, hasCtx: false });
     },
   };
@@ -133,21 +167,30 @@ const input = (s: Setup, over: Partial<Parameters<typeof runIssue>[0]> = {}) => 
   issue, config, env, repoDir: "/repo", github: true, backlog: s.backlog, ports: s.ports, ...over,
 });
 const pushes = (s: Setup) => s.log.filter((l) => l.startsWith("push:"));
+const reason = (o: unknown) => (o as { reason: string }).reason;
 
-test("a ready run: implementer then reviewer in one sandbox, check, push the guarded sha, draft PR, ready-for-human", async () => {
+test("a ready run: implementer, reviewer, container stopped, checks, guards in the clean clone, push the validated tip, PR, label", async () => {
   const s = setup();
   const out = await runIssue(input(s));
   assert.deepEqual(out, { status: "ready", branch: "afk/7", prUrl: "https://github.test/o/r/pull/9" });
   assert.deepEqual(s.log.filter((l) => !l.startsWith("read:") && !l.startsWith("rm:")), [
-    "exclude:/repo", "open", "snapshot", "agent:claude:sonnet", "agent:claude:opus",
-    "tamper-check", "resolve", "inspect", "push:afk/7@T1", "pr", "backlog:ready", "close", "removeLocal:afk/7",
-  ]);
+    "exclude:/repo", "open", "capture", "agent:claude:sonnet", "agent:claude:opus",
+    "tamper-check", "close", "tamper-check", "readTip", `clean:${TIP}`, `inspect:${TIP}`, `push:${TIP}`,
+    "pr", "backlog:ready", "close-noop-guard", "dispose", "removeLocal:afk/7",
+  ].filter((l) => l !== "close-noop-guard"));
   assert.equal(s.opened[0].branch, "afk/7");
   assert.equal(s.opened[0].baseRef, "origin/main");
-  assert.deepEqual(s.prs[0], { repoDir: "/repo", head: "afk/7", base: "main", title: "Add the thing", body: s.prs[0].body });
+  assert.deepEqual(s.prs[0], { cwd: DIR, repo: "o/r", head: "afk/7", base: "main", title: "Add the thing", body: s.prs[0].body });
   assert.match(s.prs[0].body, /Closes #7/);
-  assert.equal(s.backlogCalls[0].workdir, "/work/afk-7");
   assert.match(s.backlogCalls[0].text, /pull\/9/);
+});
+
+test("the container is stopped before any host-side git step", async () => {
+  const s = setup();
+  await runIssue(input(s));
+  assert.ok(s.log.indexOf("close") < s.log.indexOf("readTip"));
+  assert.ok(s.log.indexOf("close") < s.log.indexOf(`clean:${TIP}`));
+  assert.equal(s.log.filter((l) => l === "close").length, 1);
 });
 
 test("an agent override label replaces the implementer only", async () => {
@@ -199,12 +242,13 @@ test("an issue body cannot close the untrusted block it is rendered in", async (
   assert.ok(p.endsWith("</untrusted-issue>"));
 });
 
-test("the findings file is removed before the reviewer runs", async () => {
-  const s = setup();
+test("the findings file is removed before the reviewer runs and read before the container stops", async () => {
+  const s = setup({ findings: "x" });
   await runIssue(input(s));
   const rm = s.log.findIndex((l) => l.startsWith("rm:/tmp/afk-spec-findings.md"));
   assert.ok(rm > s.log.indexOf("agent:claude:sonnet"));
   assert.ok(rm < s.log.indexOf("agent:claude:opus"));
+  assert.ok(s.log.findIndex((l) => l.startsWith("read:")) < s.log.indexOf("close"));
 });
 
 test("no commits: blocked, nothing pushed, nothing opened as a PR", async () => {
@@ -215,8 +259,23 @@ test("no commits: blocked, nothing pushed, nothing opened as a PR", async () => 
   assert.ok(!s.log.includes("pr"));
   assert.deepEqual(s.backlogCalls.map((c) => c.fn), ["blocked"]);
   assert.match(s.backlogCalls[0].text, /no commits/i);
-  assert.equal(s.log.at(-2), "close");
   assert.equal(s.log.at(-1), "removeLocal:afk/7");
+});
+
+test("a branch without a ref is the same as no commits", async () => {
+  const s = setup({ tip: null });
+  const out = await runIssue(input(s));
+  assert.match(reason(out), /no commits/i);
+  assert.ok(!s.log.some((l) => l.startsWith("clean:")));
+});
+
+test("a tip that is not 40 hex characters is refused, a ref that cannot be read blocks", async () => {
+  const s = setup({ tip: "refs/heads/other" });
+  assert.equal((await runIssue(input(s))).status, "blocked");
+  assert.deepEqual(pushes(s), []);
+  const s2 = setup({ tip: new Error("does not hold a commit id") });
+  const out = await runIssue(input(s2));
+  assert.match(reason(out), /cannot read afk\/7/);
 });
 
 test("a change under .github/workflows is refused before pushing", async () => {
@@ -225,7 +284,6 @@ test("a change under .github/workflows is refused before pushing", async () => {
   assert.equal(out.status, "blocked");
   assert.deepEqual(pushes(s), []);
   assert.match(s.backlogCalls[0].text, /\.github\/workflows\/ci\.yml/);
-  assert.ok(s.log.includes("reset:afk/7@origin/main"));
 });
 
 test("a merge commit in the pushed range is refused", async () => {
@@ -236,30 +294,36 @@ test("a merge commit in the pushed range is refused", async () => {
   assert.match(s.backlogCalls[0].text, /merge commit/i);
 });
 
-test("HEAD off the run's branch is refused", async () => {
-  const s = setup({ resolveError: "HEAD is detached" });
+test("a commit that cannot be inspected is refused", async () => {
+  const s = setup({ inspectError: true });
   const out = await runIssue(input(s));
-  assert.equal(out.status, "blocked");
+  assert.match(reason(out), /cannot inspect/);
   assert.deepEqual(pushes(s), []);
-  assert.match(s.backlogCalls[0].text, /detached/);
 });
 
-test("tampered .git config or hooks: blocked with that reason, host git runs only after the check, nothing pushed", async () => {
+test("an unpreparable clean clone is a SetupError that marks nothing and still closes the sandbox", async () => {
+  const s = setup({ cleanError: new Error("origin unreachable") });
+  await assert.rejects(runIssue(input(s)), SetupError);
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(s.log.includes("close"));
+  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+});
+
+test("tampered .git config or hooks: blocked with that reason, no tip read, no clone, nothing pushed (GitHub)", async () => {
   const s = setup({ tampered: true });
   const out = await runIssue(input(s));
   assert.deepEqual(out, { status: "blocked", reason: "the agent modified .git configuration or hooks" });
   assert.deepEqual(pushes(s), []);
-  assert.ok(!s.log.includes("resolve") && !s.log.includes("inspect") && !s.log.includes("pr"));
-  assert.ok(s.log.indexOf("tamper-check") < s.log.indexOf("reset:afk/7@origin/main"));
+  assert.ok(!s.log.includes("readTip") && !s.log.some((l) => l.startsWith("clean:")) && !s.log.includes("pr"));
 });
 
-test("an implementer that crashed still gets the tamper check before any host git", async () => {
+test("an implementer that crashed still gets the tamper check and the container stop before the block", async () => {
   const s = setup({ tampered: true, failAgent: (r) => (r.model === "sonnet" ? new Error("boom") : undefined) });
   const out = await runIssue(input(s));
   assert.equal(out.status, "blocked");
-  assert.match((out as { reason: string }).reason, /modified \.git/);
-  assert.ok(s.log.indexOf("tamper-check") < s.log.indexOf("reset:afk/7@origin/main"));
-  assert.ok(s.log.indexOf("tamper-check") < s.log.indexOf("backlog:blocked"));
+  assert.match(reason(out), /modified \.git/);
+  assert.ok(s.log.indexOf("tamper-check") < s.log.indexOf("close"));
+  assert.ok(s.log.indexOf("close") < s.log.indexOf("backlog:blocked"));
 });
 
 test("a branch that would be the base branch is refused before a sandbox opens", async () => {
@@ -287,58 +351,17 @@ test("a reviewer failure keeps the implementer's work and says so in the PR", as
   assert.match(s.prs[0].body, /review did not complete.*review crashed/i);
 });
 
-test("a failed push blocks, keeps the local branch and does not throw", async () => {
+test("a failed push blocks (the label is swapped), keeps the local branch and does not throw", async () => {
   const s = setup({ failPush: () => true });
   const out = await runIssue(input(s));
   assert.equal(out.status, "blocked");
   assert.match(s.backlogCalls[0].text, /rejected/);
   assert.ok(!s.log.includes("pr"));
-  assert.ok(s.log.includes("close"));
+  assert.ok(s.log.includes("dispose"));
   assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
 });
 
-test("Backlog.md: a failed push blocks without a second push and says the swap stays local", async () => {
-  const s = setup({ failPush: () => true });
-  const out = await runIssue(input(s, { config: mdConfig }));
-  assert.equal(out.status, "blocked");
-  assert.equal(pushes(s).length, 1);
-  assert.match(s.backlogCalls[0].text, /stays local/i);
-  assert.ok(s.log.includes("backlog:blocked"));
-});
-
-test("Backlog.md: a failed push of the blocked branch is reported, not thrown", async () => {
-  const s = setup({ commits: 0, failPush: () => true });
-  const out = await runIssue(input(s, { config: mdConfig }));
-  assert.equal(out.status, "blocked");
-  assert.match((out as { reason: string }).reason, /stays local/i);
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
-});
-
-test("Backlog.md: a failed second push after the PR leaves a warning, not an exception", async () => {
-  const s = setup({ failPush: (n) => n === 2 });
-  const out = await runIssue(input(s, { config: mdConfig }));
-  assert.equal(out.status, "ready");
-  assert.match((out as { warning?: string }).warning ?? "", /label swap/i);
-  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
-});
-
-test("an environment failure while opening the sandbox is a SetupError and marks nothing", async () => {
-  const s = setup({ openError: new SetupError("docker daemon is down") });
-  await assert.rejects(runIssue(input(s)), SetupError);
-  assert.deepEqual(s.backlogCalls, []);
-  const s2 = setup({ openError: new Error("weird") });
-  await assert.rejects(runIssue(input(s2)), SetupError);
-  assert.deepEqual(s2.backlogCalls, []);
-});
-
-test("an issue-specific setup failure marks the issue blocked", async () => {
-  const s = setup({ openError: new IssueSetupError("branch afk/7 is checked out elsewhere") });
-  const out = await runIssue(input(s));
-  assert.deepEqual(out, { status: "blocked", reason: "branch afk/7 is checked out elsewhere" });
-  assert.deepEqual(s.backlogCalls.map((c) => [c.fn, c.hasCtx]), [["blocked", false]]);
-});
-
-test("Spec findings are posted as a PR comment on GitHub", async () => {
+test("Spec findings are posted as a PR comment on GitHub, from the clean clone", async () => {
   const s = setup({ findings: "The issue asked for X; X is missing." });
   await runIssue(input(s));
   assert.deepEqual(s.prComments, ["The issue asked for X; X is missing."]);
@@ -360,22 +383,128 @@ test("blank findings post nothing", async () => {
   assert.deepEqual(s.prComments, []);
 });
 
-test("Backlog.md: the label swap is committed in the workdir and pushed (as the new tip) after it", async () => {
+// ---- after the push, nothing throws
+
+test("a draft PR that cannot be opened after the push is a warning on a ready outcome", async () => {
+  const s = setup({ failPr: true });
+  const out = await runIssue(input(s));
+  assert.equal(out.status, "ready");
+  assert.match((out as { warning: string }).warning, /afk\/7 is pushed, but opening the draft PR failed: gh exploded/);
+  assert.ok(s.log.includes("backlog:ready"), "the issue is still marked ready-for-human");
+  assert.match(s.backlogCalls[0].text, /branch afk\/7 is pushed/);
+});
+
+test("every post-push step failing together still returns ready with all warnings", async () => {
+  const s = setup({ failPr: true, failMarkReady: true, findings: "spec", failIssueComment: true });
+  const out = await runIssue(input(s));
+  assert.equal(out.status, "ready");
+  const w = (out as { warning: string }).warning;
+  assert.match(w, /opening the draft PR failed/);
+  assert.match(w, /posting the Spec findings on the issue failed/);
+  assert.match(w, /swapping the label failed: label failed/);
+  assert.ok(s.log.includes("dispose"));
+  assert.ok(s.log.includes("removeLocal:afk/7"));
+});
+
+test("a failing PR comment or label swap is a warning too", async () => {
+  const s = setup({ failPrComment: true, failMarkReady: true, findings: "spec" });
+  const out = await runIssue(input(s));
+  assert.equal(out.status, "ready");
+  assert.match((out as { warning: string }).warning, /posting the Spec findings on the PR failed.*swapping the label failed/);
+});
+
+// ---- Backlog.md
+
+test("Backlog.md: the label swap is committed in the clean clone on the pushed tip, guarded again and pushed as the new head", async () => {
   const s = setup();
   await runIssue(input(s, { config: mdConfig }));
   assert.ok(!/Closes/.test(s.prs[0].body));
-  assert.deepEqual(s.log.filter((l) => /^(push|pr|backlog:ready)/.test(l)), ["push:afk/7@T1", "pr", "backlog:ready", "push:afk/7@T2"]);
+  assert.deepEqual(s.log.filter((l) => /^(push|pr|backlog:ready|checkout|inspect)/.test(l)), [
+    `inspect:${TIP}`, `push:${TIP}`, "pr", `checkout:${TIP}`, "backlog:ready", `inspect:${SWAP}`, `push:${SWAP}`,
+  ]);
+  const ready = s.backlogCalls.find((c) => c.fn === "ready")!;
+  assert.equal(ready.workdir, DIR, "the swap is committed in the clean clone, never the shared worktree");
+  assert.notEqual(ready.workdir, "/work/afk-7");
 });
 
-test("Backlog.md blocked: the branch is reset to the base, the swap committed, and only that pushed", async () => {
+test("Backlog.md: a swap commit that touches a workflow is not pushed", async () => {
+  const s = setup({ swapChanged: [".github/workflows/x.yml"] });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "ready");
+  assert.match((out as { warning: string }).warning, /label-swap commit was not pushed/);
+  assert.deepEqual(pushes(s), [`push:${TIP}`]);
+});
+
+test("Backlog.md blocked: the clean clone is checked out at the captured base commit, the swap committed there and only it pushed", async () => {
   const s = setup({ commits: 0 });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "blocked");
+  assert.deepEqual(s.log.filter((l) => /^(checkout|backlog|push|clean)/.test(l)), [`clean:${TIP}`, `checkout:${BASE}`, "backlog:blocked", `push:${SWAP}`]);
+  assert.equal(s.backlogCalls[0].workdir, DIR);
+});
+
+test("Backlog.md blocked by tampering needs no agent objects: the clone has no tip", async () => {
+  const s = setup({ tampered: true });
   await runIssue(input(s, { config: mdConfig }));
-  assert.deepEqual(s.log.filter((l) => /^(reset|push|backlog)/.test(l)), ["reset:afk/7@origin/main", "backlog:blocked", "push:afk/7@T2"]);
-  assert.equal(s.backlogCalls[0].workdir, "/work/afk-7");
+  assert.deepEqual(s.log.filter((l) => /^(checkout|backlog|push|clean)/.test(l)), ["clean:null", `checkout:${BASE}`, "backlog:blocked", `push:${SWAP}`]);
+});
+
+test("Backlog.md: a failed push of the work records nothing, pushes nothing else and says the work stays local", async () => {
+  const s = setup({ failPush: () => true });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "blocked");
+  assert.equal((out as { unmarked?: boolean }).unmarked, true);
+  assert.match(reason(out), /stays in the local branch/);
+  assert.equal(pushes(s).length, 1);
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+});
+
+test("Backlog.md: a failed push of the blocked branch is reported unrecorded, not thrown", async () => {
+  const s = setup({ commits: 0, failPush: () => true });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "blocked");
+  assert.match(reason(out), /stays unrecorded/);
+  assert.ok(!s.log.some((l) => l.startsWith("removeLocal")));
+});
+
+test("Backlog.md: a failed second push after the PR leaves a warning, not an exception", async () => {
+  const s = setup({ failPush: (n) => n === 2 });
+  const out = await runIssue(input(s, { config: mdConfig }));
+  assert.equal(out.status, "ready");
+  assert.match((out as { warning?: string }).warning ?? "", /committing the label swap failed: rejected/);
+});
+
+test("Backlog.md: blocks before a sandbox exists cannot be recorded and come back unmarked", async () => {
+  const s = setup();
+  const out = await runIssue(input(s, { config: { ...mdConfig, baseBranch: "afk/7" } }));
+  assert.equal(out.status, "blocked");
+  assert.equal((out as { unmarked?: boolean }).unmarked, true);
+  assert.deepEqual(s.backlogCalls, []);
+  const s2 = setup({ openError: new IssueSetupError("claimed") });
+  const out2 = await runIssue(input(s2, { config: mdConfig }));
+  assert.deepEqual(out2, { status: "blocked", reason: "claimed", unmarked: true });
+  assert.deepEqual(s2.backlogCalls, []);
 });
 
 test("GitHub blocked pushes nothing", async () => {
   const s = setup({ commits: 0 });
   await runIssue(input(s));
   assert.deepEqual(pushes(s), []);
+});
+
+test("an environment failure while opening the sandbox is a SetupError and marks nothing", async () => {
+  const s = setup({ openError: new SetupError("docker daemon is down") });
+  await assert.rejects(runIssue(input(s)), SetupError);
+  assert.deepEqual(s.backlogCalls, []);
+  const s2 = setup({ openError: new Error("weird") });
+  await assert.rejects(runIssue(input(s2)), SetupError);
+  assert.deepEqual(s2.backlogCalls, []);
+});
+
+test("an issue-specific setup failure marks a GitHub issue blocked", async () => {
+  const s = setup({ openError: new IssueSetupError("branch afk/7 is checked out elsewhere") });
+  const out = await runIssue(input(s));
+  assert.deepEqual(out, { status: "blocked", reason: "branch afk/7 is checked out elsewhere" });
+  assert.deepEqual(s.backlogCalls.map((c) => [c.fn, c.hasCtx]), [["blocked", false]]);
 });

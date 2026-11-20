@@ -4,15 +4,22 @@
 //
 // Everything that touches Docker, git, gh or the file system sits behind RunPorts
 // (src/sandbox.ts and src/hostgit.ts have the real ones), so the orchestration is tested
-// with fakes. The agents never talk to GitHub or the backlog and never push: the run does,
-// after the guards below have passed. Because an agent can write the repository's .git
-// directory, the run checks it against a snapshot before it runs any host git command
-// that matters (see hostgit.ts).
+// with fakes. The agents never talk to GitHub or the backlog and never push: the run does.
+//
+// The security boundary is described in hostgit.ts: the shared `.git` is writable from the
+// container, so after the agents ran the run reads only one value from it (the branch tip),
+// and does every guard, the Backlog.md label swap and the push in a fresh clone.
+//
+// After a successful push the run never throws. Opening the PR, posting the Spec findings,
+// swapping the label and pushing the swap commit are each tried on their own, and a failure
+// becomes a `warning` on a `ready` outcome: the branch is on the remote, so the issue is
+// claimed and the work exists, and reporting it blocked would be wrong.
 import type { Backlog, BacklogIssue } from "./backlog/types.ts";
 import type { AfkConfig, AgentName } from "./config.ts";
 import { AGENT_TOKEN_VARS, requireSecrets } from "./env.ts";
 import type { AfkEnv } from "./env.ts";
-import type { GitPorts, GitSnapshot } from "./hostgit.ts";
+import { githubSlug } from "./hostgit.ts";
+import type { CleanClone, GitPorts } from "./hostgit.ts";
 import { modelFor } from "./models.ts";
 import { loadPrompt, renderPrompt } from "./prompts.ts";
 
@@ -23,8 +30,8 @@ export const TAMPERED_REASON = "the agent modified .git configuration or hooks";
 
 /**
  * The environment is not ready (git fetch, docker build or the Docker daemon failed, the kit has no
- * upstream commit). Nothing is wrong with the issue, so runIssue throws it without touching the
- * issue's labels; the daemon (#8) should back off and retry, not relabel.
+ * upstream commit, the clean clone could not be fetched). Nothing is wrong with the issue, so runIssue
+ * throws it without touching the issue's labels; the daemon (#8) should back off and retry, not relabel.
  */
 export class SetupError extends Error {
   constructor(message: string, options?: { cause?: unknown }) {
@@ -53,28 +60,29 @@ export interface AgentRun {
 }
 
 export interface RunSandbox {
-  /** Host path of the worktree on `afk/<id>`. */
+  /** Host path of the worktree on `afk/<id>`. Used to capture git's directories before the agents run, and for nothing else. */
   workdir: string;
   /** Run one agent to completion in the sandbox; rejects when the agent fails. */
   runAgent(run: AgentRun): Promise<void>;
   /** Contents of a file inside the sandbox, or null when it does not exist. */
   readFile(path: string): Promise<string | null>;
   removeFile(path: string): Promise<void>;
+  /** Stop the container and remove the worktree. Idempotent. After it, no process of the agents runs. */
   close(): Promise<void>;
 }
 
 export interface RunPorts {
   /**
-   * Create the worktree on `branch` (forked from `baseRef`) and start the sandbox with `env` set.
-   * Throws SetupError for an environment problem and IssueSetupError for an issue-specific one;
-   * anything else is treated as a SetupError.
+   * Create the worktree on `branch` (forked from `baseRef`, which has just been fetched) and start the
+   * sandbox with `env` set. Throws SetupError for an environment problem and IssueSetupError for an
+   * issue-specific one; anything else is treated as a SetupError.
    */
   openSandbox(o: { branch: string; baseRef: string; repoDir: string; env: Record<string, string> }): Promise<RunSandbox>;
   git: GitPorts;
   github: {
-    /** Open a draft PR and return its URL. */
-    createDraftPr(o: { repoDir: string; head: string; base: string; title: string; body: string }): Promise<string>;
-    commentOnPr(repoDir: string, prUrl: string, body: string): Promise<void>;
+    /** Open a draft PR in `repo` (`owner/name`) from a neutral directory and return its URL. */
+    createDraftPr(o: { cwd: string; repo: string; head: string; base: string; title: string; body: string }): Promise<string>;
+    commentOnPr(o: { cwd: string; repo: string; prUrl: string; body: string }): Promise<void>;
   };
   /** File contents, or null when the file does not exist. */
   readText(path: string): string | null;
@@ -92,13 +100,21 @@ export interface RunInput {
 }
 
 export type RunOutcome =
+  /** The branch is pushed. `warning` names every step after the push that failed. */
   | { status: "ready"; branch: string; prUrl?: string; warning?: string }
-  | { status: "blocked"; reason: string };
+  /**
+   * Nothing was pushed (or, for Backlog.md, only the label swap). `unmarked` is set when the backlog
+   * could not record it, which for Backlog.md is always the case before a sandbox exists, because
+   * the label swap is a commit on a pushed branch; the caller decides what to do with the issue.
+   */
+  | { status: "blocked"; reason: string; unmarked?: true };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
 /** The issue text is data, fenced in the prompt; it must not be able to write its own closing fence. */
 const defence = (text: string) => text.replace(/<\/(untrusted-issue)/gi, "<\\/$1");
+
+const HEX40 = /^[0-9a-f]{40}$/;
 
 export async function runIssue(input: RunInput): Promise<RunOutcome> {
   const { issue, config, env, repoDir, backlog, ports } = input;
@@ -108,14 +124,23 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
 
   const branch = `afk/${issue.id}`;
   const baseRef = `origin/${config.baseBranch}`;
+  const isMd = config.backlog === "backlog-md";
+
+  // A block before any sandbox exists. GitHub can label right away; Backlog.md records a block as a
+  // commit on a pushed branch, which does not exist yet, so the caller gets the reason unmarked.
+  const blockEarly = async (reason: string): Promise<RunOutcome> => {
+    if (isMd) return { status: "blocked", reason, unmarked: true };
+    await backlog.markBlocked(issue.id, reason);
+    return { status: "blocked", reason };
+  };
 
   // Guards that need no sandbox. The base branch is never the target of an AFK run.
   if (!/^[A-Za-z0-9._-]+$/.test(issue.id) || branch === config.baseBranch) {
-    const why = branch === config.baseBranch
-      ? `the run's branch ${branch} is the base branch; an AFK run never pushes to the base branch`
-      : `the issue id ${JSON.stringify(issue.id)} cannot be used in a branch name`;
-    await backlog.markBlocked(issue.id, why);
-    return { status: "blocked", reason: why };
+    return blockEarly(
+      branch === config.baseBranch
+        ? `the run's branch ${branch} is the base branch; an AFK run never pushes to the base branch`
+        : `the issue id ${JSON.stringify(issue.id)} cannot be used in a branch name`,
+    );
   }
 
   const sandboxEnv: Record<string, string> = {};
@@ -128,51 +153,29 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
   try {
     sandbox = await ports.openSandbox({ branch, baseRef, repoDir, env: sandboxEnv });
   } catch (e) {
-    if (e instanceof IssueSetupError) {
-      await backlog.markBlocked(issue.id, e.message);
-      return { status: "blocked", reason: e.message };
-    }
+    if (e instanceof IssueSetupError) return blockEarly(e.message);
     throw e instanceof SetupError ? e : new SetupError(`sandbox setup failed: ${message(e)}`, { cause: e });
   }
-  const workdir = sandbox.workdir;
-  const pushesBlockedBranch = config.backlog === "backlog-md";
+
+  let closed = false;
+  const stopSandbox = async () => {
+    if (closed) return;
+    closed = true;
+    await sandbox.close();
+  };
   // The local worktree and branch are removed at the end unless something stayed unpushed.
   let keepLocal = true;
-
-  // Push `branch` as it is now. Returns an error message, or null on success. Never throws.
-  const pushCurrent = async (snap: GitSnapshot): Promise<string | null> => {
-    try {
-      const r = await ports.git.resolve(workdir, branch, baseRef);
-      if ("error" in r) return r.error;
-      await ports.git.push(workdir, snap, branch, r.tip);
-      return null;
-    } catch (e) {
-      return message(e);
-    }
-  };
+  let clean: CleanClone | undefined;
 
   try {
-    const snap = await ports.git.snapshot(workdir);
-
-    // Nothing is pushed: drop whatever the agents committed, record the reason, and for Backlog.md
-    // push the branch holding only the label-swap commit (the branch keeps the claim). When the push of
-    // the work itself failed (`pushFailed`), the work stays local and nothing is pushed a second time.
-    // A failed push of the label swap is reported in the reason; this never throws for a push.
-    const block = async (reason: string, pushFailed = false): Promise<RunOutcome> => {
-      if (!pushFailed) await ports.git.resetBranch(workdir, branch, baseRef);
-      let why = reason;
-      if (pushesBlockedBranch && pushFailed) why += `; the label-swap commit stays local on ${branch}`;
-      await backlog.markBlocked(issue.id, why, { workdir });
-      if (pushFailed) {
-        keepLocal = true;
-      } else if (pushesBlockedBranch) {
-        const failed = await pushCurrent(snap);
-        if (failed !== null) why += `; pushing the label swap failed (${failed}), so it stays local on ${branch}`;
-        else keepLocal = false;
-      } else {
-        keepLocal = false;
+    // I1: before any agent runs, after the host fetch.
+    const snap = await ports.git.capture(repoDir, sandbox.workdir, config.baseBranch);
+    const cleanClone = async (tip: string | null): Promise<CleanClone> => {
+      try {
+        return (clean ??= await ports.git.createClean(snap, branch, tip));
+      } catch (e) {
+        throw e instanceof SetupError ? e : new SetupError(`cannot prepare a clean clone: ${message(e)}`, { cause: e });
       }
-      return { status: "blocked", reason: why };
     };
 
     const vars = {
@@ -199,69 +202,146 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     } catch (e) {
       implementerFailure = `the implementer (${implementer}) failed: ${message(e)}`;
     }
+    let findings: string | null = null;
     if (implementerFailure === null) {
       try {
         await sandbox.removeFile(FINDINGS_FILE); // nothing an earlier phase left there counts as a finding
         await phase("reviewer", reviewer);
+        findings = await sandbox.readFile(FINDINGS_FILE).catch(() => null);
       } catch (e) {
         reviewNote = `Review did not complete: the reviewer (${reviewer}) failed: ${message(e)}`;
       }
     }
 
-    // Before any other host git command: the agents could write .git while they ran.
-    if (await ports.git.restoreIfTampered(workdir, snap)) return await block(TAMPERED_REASON);
+    // I2: stop the container before any host-side git step. The user's .git is put back first (the
+    // closing of the sandbox runs git in it) and once more after, in case the closing exposed it.
+    let tampered = await ports.git.restoreIfTampered(snap);
+    await stopSandbox();
+    tampered = (await ports.git.restoreIfTampered(snap)) || tampered;
+
+    /**
+     * Record that nothing is pushed. GitHub: label and comment. Backlog.md: in the clean clone, on
+     * `afk/<id>` at the captured base commit, commit the label swap and push that one commit (the
+     * branch keeps the claim). `pushFailed` means the work's own push failed, so there is no branch
+     * to record on; the work stays in the local branch and Backlog.md gets no mark.
+     */
+    const block = async (reason: string, pushFailed = false): Promise<RunOutcome> => {
+      let why = reason;
+      if (!isMd) {
+        await backlog.markBlocked(issue.id, why);
+        keepLocal = pushFailed;
+        return { status: "blocked", reason: why };
+      }
+      if (pushFailed) {
+        return { status: "blocked", reason: `${why}; the Backlog.md label swap was not recorded, and the work stays in the local branch ${branch}`, unmarked: true };
+      }
+      try {
+        const c = await cleanClone(null);
+        await c.checkout(snap.baseSha);
+        await backlog.markBlocked(issue.id, why, { workdir: c.dir });
+        const head = await c.head();
+        const bad = await pushable(c, head, false);
+        if (bad !== null) throw new Error(bad);
+        await c.push(head);
+        keepLocal = false;
+        return { status: "blocked", reason: why };
+      } catch (e) {
+        return { status: "blocked", reason: `${why}; recording the block on ${branch} failed (${message(e)}), so it stays unrecorded`, unmarked: true };
+      }
+    };
+
+    /** I5: the guards, in the clean clone, on exactly the commit that would be pushed. Null when it may go. */
+    const pushable = async (c: CleanClone, sha: string, requireCommits: boolean): Promise<string | null> => {
+      let info;
+      try {
+        info = await c.inspect(sha);
+      } catch (e) {
+        return `cannot inspect ${sha}: ${message(e)}`;
+      }
+      if (requireCommits && info.commits === 0) return "the implementer made no commits";
+      if (info.merges > 0) return `${branch} contains a merge commit; an AFK run's history must be linear`;
+      const touched = info.files.filter((f) => f.startsWith(PROTECTED_PREFIX));
+      if (touched.length > 0) return `the branch touches ${PROTECTED_PREFIX}** (${touched.join(", ")}); an AFK run never edits workflows`;
+      return null;
+    };
+
+    if (tampered) return await block(TAMPERED_REASON);
     if (implementerFailure !== null) return await block(implementerFailure);
 
-    const resolved = await ports.git.resolve(workdir, branch, baseRef);
-    if ("error" in resolved) return await block(`cannot push ${branch}: ${resolved.error}`);
-    const { base, tip } = resolved;
-    const changes = await ports.git.inspect(workdir, base, tip);
-    if (changes.commits === 0) return await block("the implementer made no commits");
-    if (changes.merges > 0) return await block(`${branch} contains a merge commit; an AFK run's history must be linear`);
-    const touched = changes.files.filter((f) => f.startsWith(PROTECTED_PREFIX));
-    if (touched.length > 0) {
-      return await block(`the branch touches ${PROTECTED_PREFIX}** (${touched.join(", ")}); an AFK run never edits workflows`);
+    // I3: the one value read from the shared repository.
+    let tip: string | null;
+    try {
+      tip = await ports.git.readTip(snap, branch);
+    } catch (e) {
+      return await block(`cannot read ${branch}: ${message(e)}`);
     }
+    if (tip === null || !HEX40.test(tip)) return await block("the implementer made no commits");
+
+    // I4, I5
+    const c = await cleanClone(tip);
+    const bad = await pushable(c, tip, true);
+    if (bad !== null) return await block(bad);
 
     try {
-      await ports.git.push(workdir, snap, branch, tip);
+      await c.push(tip);
     } catch (e) {
       return await block(`pushing ${branch} failed: ${message(e)}`, true);
     }
     keepLocal = false;
 
-    const findings = reviewNote ? null : await sandbox.readFile(FINDINGS_FILE);
-    const spec = findings && findings.trim() !== "" ? findings : null;
+    // From here on nothing throws: the work is on the remote.
+    const warnings: string[] = [];
+    const attempt = async <T>(step: string, fn: () => Promise<T>): Promise<T | undefined> => {
+      try {
+        return await fn();
+      } catch (e) {
+        warnings.push(`${step} failed: ${message(e)}`);
+        return undefined;
+      }
+    };
 
+    const spec = !reviewNote && findings && findings.trim() !== "" ? findings : null;
     let prUrl: string | undefined;
     if (input.github) {
+      const repo = githubSlug(snap.originUrl);
       const body = [
         `AFK run for ${issue.url}.`,
         ...(config.backlog === "github" ? [`Closes #${issue.id}`] : []),
         ...(reviewNote ? [reviewNote] : []),
       ].join("\n\n");
-      prUrl = await ports.github.createDraftPr({ repoDir, head: branch, base: config.baseBranch, title: issue.title, body });
+      prUrl = repo === null
+        ? (warnings.push("opening the draft PR failed: origin is not a GitHub repository URL"), undefined)
+        : await attempt("opening the draft PR", () => ports.github.createDraftPr({ cwd: c.dir, repo, head: branch, base: config.baseBranch, title: issue.title, body }));
     }
     if (spec) {
-      if (prUrl) await ports.github.commentOnPr(repoDir, prUrl, spec);
-      else await backlog.comment(issue.id, spec);
+      if (prUrl) await attempt("posting the Spec findings on the PR", () => ports.github.commentOnPr({ cwd: c.dir, repo: githubSlug(snap.originUrl)!, prUrl: prUrl!, body: spec }));
+      else await attempt("posting the Spec findings on the issue", () => backlog.comment(issue.id, spec));
     }
 
-    await backlog.markReadyForHuman(issue.id, prUrl ? `AFK run finished: ${prUrl}` : `AFK run finished: branch ${branch} is pushed`, { workdir });
-    let warning: string | undefined;
-    if (pushesBlockedBranch) {
-      const failed = await pushCurrent(snap);
-      if (failed !== null) {
-        warning = `the label swap commit is not pushed (${failed}); it stays local on ${branch}`;
-        keepLocal = true;
-      }
+    // I6: the label swap is committed in the clean clone (Backlog.md) on top of the pushed tip, checked again, pushed.
+    const said = prUrl ? `AFK run finished: ${prUrl}` : `AFK run finished: branch ${branch} is pushed${warnings.length ? ` (${warnings.join("; ")})` : ""}`;
+    if (isMd) {
+      await attempt("committing the label swap", async () => {
+        await c.checkout(tip);
+        await backlog.markReadyForHuman(issue.id, said, { workdir: c.dir });
+        const finalSha = await c.head();
+        const stop = await pushable(c, finalSha, true);
+        if (stop !== null) throw new Error(`the label-swap commit was not pushed: ${stop}`);
+        await c.push(finalSha);
+      });
+    } else {
+      await attempt("swapping the label", () => backlog.markReadyForHuman(issue.id, said));
     }
+
+    const warning = warnings.length ? `${branch} is pushed, but ${warnings.join("; ")}` : undefined;
     return { status: "ready", branch, ...(prUrl ? { prUrl } : {}), ...(warning ? { warning } : {}) };
   } finally {
     try {
-      await sandbox.close();
+      await stopSandbox();
     } finally {
+      await clean?.dispose().catch(() => {});
       if (!keepLocal) await ports.git.removeLocal(repoDir, branch).catch(() => {});
     }
   }
 }
+

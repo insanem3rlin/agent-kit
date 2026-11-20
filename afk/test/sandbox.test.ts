@@ -6,7 +6,7 @@ import { mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SetupError } from "../src/run.ts";
-import { dockerBuildArgs, draftPrArgs, imageNameFor, kitCommit } from "../src/sandbox.ts";
+import { dockerBuildArgs, draftPrArgs, imageNameFor, isIssueSpecificSetupFailure, kitCommit } from "../src/sandbox.ts";
 
 test("the image build passes the kit commit as AGENT_KIT_REF", () => {
   const args = dockerBuildArgs({ imageName: "afk-r", repoDir: "/r", kitRef: "abc123", uid: 1000, gid: 1000 });
@@ -19,7 +19,8 @@ test("the image name is a valid tag", () => {
 });
 
 test("the PR is a draft against the base branch, body from stdin", () => {
-  const args = draftPrArgs({ head: "afk/7", base: "main", title: "T" });
+  const args = draftPrArgs({ repo: "o/r", head: "afk/7", base: "main", title: "T" });
+  assert.equal(args[args.indexOf("--repo") + 1], "o/r");
   assert.ok(args.includes("--draft"));
   assert.equal(args[args.indexOf("--base") + 1], "main");
   assert.equal(args[args.indexOf("--head") + 1], "afk/7");
@@ -45,7 +46,7 @@ test("the kit commit baked into the image is one the remote has, and a local-onl
   const pushed = git(kit, "rev-parse", "HEAD");
   const lines: string[] = [];
   assert.equal(await kitCommit(kit, (l) => lines.push(l)), pushed);
-  assert.deepEqual(lines, []);
+  assert.equal(lines.length, 0);
   writeFileSync(join(kit, "f"), "2");
   git(kit, "commit", "-qam", "local only");
   assert.equal(await kitCommit(kit, (l) => lines.push(l)), pushed);
@@ -60,4 +61,13 @@ test("a kit checkout without an upstream is a SetupError", async () => {
   git(root, "add", ".");
   git(root, "commit", "-q", "-m", "one");
   await assert.rejects(kitCommit(root), SetupError);
+});
+
+test("only the two exact sandcastle messages are issue-specific setup failures", () => {
+  assert.equal(isIssueSpecificSetupFailure("Branch 'afk/7' is already checked out in worktree at '/srv/w'."), true);
+  assert.equal(isIssueSpecificSetupFailure("Branch 'afk/7' is already checked out in another worktree."), true);
+  assert.equal(isIssueSpecificSetupFailure("fatal: '/srv/r/.sandcastle/worktrees/afk-7' already exists"), true);
+  for (const m of ["worktree add failed: no space left on device", "fatal: not a git repository", "docker: Cannot connect to the Docker daemon", "branch protection already exists", "git worktree is locked"]) {
+    assert.equal(isIssueSpecificSetupFailure(m), false, m);
+  }
 });

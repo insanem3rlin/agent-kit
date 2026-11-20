@@ -34,8 +34,8 @@ export function dockerBuildArgs(o: { imageName: string; repoDir: string; kitRef:
   ];
 }
 
-export function draftPrArgs(o: { head: string; base: string; title: string }): string[] {
-  return ["pr", "create", "--draft", "--head", o.head, "--base", o.base, "--title", o.title, "--body-file", "-"];
+export function draftPrArgs(o: { repo: string; head: string; base: string; title: string }): string[] {
+  return ["pr", "create", "--draft", "--repo", o.repo, "--head", o.head, "--base", o.base, "--title", o.title, "--body-file", "-"];
 }
 
 function agentProvider(sandcastle: typeof import("@ai-hero/sandcastle"), agent: AgentName, model: string) {
@@ -67,7 +67,14 @@ export async function kitCommit(kitDir: string, log: (line: string) => void = ()
   }
 }
 
-const ISSUE_SPECIFIC = /already (?:checked out|exists|used by worktree)|is already|worktree/i;
+/**
+ * The two ways creating the worktree fails because of this issue's branch, worded as sandcastle 0.14.0 and
+ * git word them (chunk-G2R53CVZ.js in sandcastle's dist, and `git worktree add`): the branch is checked out in
+ * another worktree, or the worktree path exists. Any other failure is the environment's.
+ */
+export function isIssueSpecificSetupFailure(msg: string): boolean {
+  return /Branch '[^']*' is already checked out in (?:worktree at '[^']*'|another worktree)./.test(msg) || /fatal: '[^']*' already exists/.test(msg);
+}
 
 export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) => console.error(l)): RunPorts {
   const hostEnv = gitEnv({ ...process.env, ...(afkEnv.GH_TOKEN ? { GH_TOKEN: afkEnv.GH_TOKEN } : {}) });
@@ -98,7 +105,7 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
       }
       if (claimed) throw new IssueSetupError(`${branch} already exists on the remote, so the issue is claimed`);
       try {
-        await removeStale(repoDir, branch, hostEnv);
+        await removeStale(repoDir, branch, { env: hostEnv, keep: true, log });
       } catch (e) {
         throw new IssueSetupError(`cannot clear the leftover local ${branch}: ${(e as Error).message}`, { cause: e });
       }
@@ -115,8 +122,9 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
         });
       } catch (e) {
         const msg = (e as Error).message;
-        throw ISSUE_SPECIFIC.test(msg) ? new IssueSetupError(`cannot create the worktree for ${branch}: ${msg}`, { cause: e }) : new SetupError(`cannot start the sandbox: ${msg}`, { cause: e });
+        throw isIssueSpecificSetupFailure(msg) ? new IssueSetupError(`cannot create the worktree for ${branch}: ${msg}`, { cause: e }) : new SetupError(`cannot start the sandbox: ${msg}`, { cause: e });
       }
+      let closed = false;
       return {
         workdir: sandbox.worktreePath,
         async runAgent(run: AgentRun) {
@@ -130,18 +138,21 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
           await sandbox.exec(`rm -f ${JSON.stringify(path)}`);
         },
         async close() {
+          if (closed) return;
+          closed = true;
           await sandbox.close();
         },
       };
     },
-    git: createGitPorts(hostEnv),
+    git: createGitPorts(hostEnv, log),
     github: {
-      async createDraftPr({ repoDir, head, base, title, body }) {
-        const out = await exec("gh", draftPrArgs({ head, base, title }), { cwd: repoDir, env: hostEnv, input: body });
+      // From the clean clone, with --repo, never from the user's repository (whose config an agent could have written).
+      async createDraftPr({ cwd, repo, head, base, title, body }) {
+        const out = await exec("gh", draftPrArgs({ repo, head, base, title }), { cwd, env: hostEnv, input: body });
         return out.trim().split("\n").at(-1) ?? "";
       },
-      async commentOnPr(repoDir, prUrl, body) {
-        await exec("gh", ["pr", "comment", prUrl, "--body-file", "-"], { cwd: repoDir, env: hostEnv, input: body });
+      async commentOnPr({ cwd, repo, prUrl, body }) {
+        await exec("gh", ["pr", "comment", prUrl, "--repo", repo, "--body-file", "-"], { cwd, env: hostEnv, input: body });
       },
     },
     readText(path) {
