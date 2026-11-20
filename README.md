@@ -71,7 +71,7 @@ agent-kit afk         # runs the daemon in this repository; stop it with Ctrl+C
 
 `init` writes a default config (GitHub backlog, `claude` as implementer and reviewer, one run at a time). Review it, and put `GH_TOKEN` and the agent tokens in `~/.config/agent-kit/afk.env` first; [`INSTALL.md`](INSTALL.md) lists the prerequisites.
 
-- **Labels.** `afk` hands an issue over. `afk:<agent>` (`afk:claude`, `afk:codex` or `afk:cursor`) picks the implementer for that issue instead of the configured one. When a run ends, `ready-for-human` replaces `afk`. `afk-blocked` marks a run that pushed no work, with a comment giving the reason.
+- **Labels.** `afk` hands an issue over. `afk:<agent>` (`afk:claude`, `afk:codex` or `afk:cursor`) picks the implementer for that issue instead of the configured one. When a run pushes its work, `ready-for-human` replaces `afk`. `afk-blocked` marks a run that pushed no work, and also an issue the daemon never ran because its `afk:<agent>` label was unknown or conflicting; the comment says why.
 - **Backlogs.** Issues are GitHub issues or Backlog.md tasks committed in the repository, set by `backlog` in `.afk/config.json`.
 - **Limits.** A run never merges, never pushes to the base branch and never edits `.github/workflows/**`.
 

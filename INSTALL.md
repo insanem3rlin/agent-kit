@@ -81,7 +81,7 @@ Check these and stop with a clear message if one fails.
 
 ## AFK prerequisites (optional)
 
-The install above does not need these. They matter only for `agent-kit afk`, the unattended issue runner described in the README. When the user wants AFK runs, check and set up the following; `agent-kit doctor` reports the first two.
+The install above does not need these. They matter only for `agent-kit afk`, the unattended issue runner described in the README. When the user wants AFK runs, check and set up the following. `agent-kit doctor` reports the Node version and only the docker CLI version (`docker --version`), so use `docker info` to check that the daemon runs.
 
 1. Node 22.18 or newer (`node --version`). `agent-kit afk` refuses to start on an older one.
 2. A running Docker daemon (`docker info` succeeds). The runs happen in Docker sandboxes.
