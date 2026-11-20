@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CONFIG_DIR } from "./config.ts";
 import type { AgentName } from "./config.ts";
 import type { AfkEnv } from "./env.ts";
-import { createGitPorts, exec, gitEnv, remoteHasBranch, removeStale } from "./hostgit.ts";
+import { createGitPorts, exec, gitEnv, remoteHasBranch } from "./hostgit.ts";
 import { IssueSetupError, SetupError } from "./run.ts";
 import type { AgentRun, RunPorts, RunSandbox } from "./run.ts";
 
@@ -79,15 +79,13 @@ export function isIssueSpecificSetupFailure(msg: string): boolean {
 export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) => console.error(l)): RunPorts {
   const hostEnv = gitEnv({ ...process.env, ...(afkEnv.GH_TOKEN ? { GH_TOKEN: afkEnv.GH_TOKEN } : {}) });
   return {
-    async openSandbox({ branch, baseRef, repoDir, env }): Promise<RunSandbox> {
-      const baseBranch = baseRef.replace(/^origin\//, "");
+    async openSandbox({ branch, baseRef, repoDir, runDir, env }): Promise<RunSandbox> {
       // Environment first: a failure here says nothing about the issue.
       let kitRef: string;
       const imageName = imageNameFor(repoDir);
       const uid = process.getuid?.() ?? 1000;
       const gid = process.getgid?.() ?? 1000;
       try {
-        await exec("git", ["fetch", "origin", baseBranch], { cwd: repoDir, env: hostEnv, timeoutMs: 120_000 });
         kitRef = await kitCommit(KIT_DIR, log);
         await exec("docker", dockerBuildArgs({ imageName, repoDir, kitRef, uid, gid }));
       } catch (e) {
@@ -95,20 +93,14 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
       }
 
       // Then the issue. The daemon only starts unclaimed issues, so a claim on the remote means someone
-      // else owns the branch. Anything local left from an earlier run is stale: sandcastle ignores the
-      // base ref when the branch already exists, so it would resume the old work.
+      // else owns the branch. The run clone is fresh, so nothing local can be left over from an earlier run.
       let claimed: boolean;
       try {
-        claimed = await remoteHasBranch(repoDir, branch, hostEnv);
+        claimed = await remoteHasBranch(runDir, branch, hostEnv);
       } catch (e) {
         throw new SetupError(`cannot reach origin to check for a claim: ${(e as Error).message}`, { cause: e });
       }
       if (claimed) throw new IssueSetupError(`${branch} already exists on the remote, so the issue is claimed`);
-      try {
-        await removeStale(repoDir, branch, { env: hostEnv, keep: true, log });
-      } catch (e) {
-        throw new IssueSetupError(`cannot clear the leftover local ${branch}: ${(e as Error).message}`, { cause: e });
-      }
 
       const sandcastle = await import("@ai-hero/sandcastle");
       const { docker } = await import("@ai-hero/sandcastle/sandboxes/docker");
@@ -117,7 +109,7 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
         sandbox = await sandcastle.createSandbox({
           branch,
           baseBranch: baseRef,
-          cwd: repoDir,
+          cwd: runDir, // the disposable run clone: its .git and .sandcastle/ are what the container mounts
           sandbox: docker({ imageName, containerUid: uid, containerGid: gid, env }),
         });
       } catch (e) {
@@ -126,7 +118,6 @@ export function createPorts(afkEnv: AfkEnv, log: (line: string) => void = (l) =>
       }
       let closed = false;
       return {
-        workdir: sandbox.worktreePath,
         async runAgent(run: AgentRun) {
           await sandbox.run({ agent: agentProvider(sandcastle, run.agent, run.model), prompt: run.prompt, name: run.name });
         },

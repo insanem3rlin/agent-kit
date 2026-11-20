@@ -6,9 +6,10 @@
 // (src/sandbox.ts and src/hostgit.ts have the real ones), so the orchestration is tested
 // with fakes. The agents never talk to GitHub or the backlog and never push: the run does.
 //
-// The security boundary is described in hostgit.ts: the shared `.git` is writable from the
-// container, so after the agents ran the run reads only one value from it (the branch tip),
-// and does every guard, the Backlog.md label swap and the push in a fresh clone.
+// The security boundary is described in hostgit.ts: the agents work in a disposable clone of
+// origin (the run clone), never in the user's repository. After they ran the run reads one value
+// from the run clone (the branch tip), imports its objects into a second fresh clone, and does
+// every guard, the Backlog.md label swap and the push there.
 //
 // After a successful push the run never throws. Opening the PR, posting the Spec findings,
 // swapping the label and pushing the swap commit are each tried on their own, and a failure
@@ -18,15 +19,14 @@ import type { Backlog, BacklogIssue } from "./backlog/types.ts";
 import type { AfkConfig, AgentName } from "./config.ts";
 import { AGENT_TOKEN_VARS, requireSecrets } from "./env.ts";
 import type { AfkEnv } from "./env.ts";
-import { githubSlug } from "./hostgit.ts";
-import type { CleanClone, GitPorts } from "./hostgit.ts";
+import { ImportError, githubSlug } from "./hostgit.ts";
+import type { CleanClone, GitPorts, RunClone } from "./hostgit.ts";
 import { modelFor } from "./models.ts";
 import { loadPrompt, renderPrompt } from "./prompts.ts";
 
 /** Where the reviewer writes its Spec findings, inside the sandbox and outside the repository. */
 export const FINDINGS_FILE = "/tmp/afk-spec-findings.md";
 export const PROTECTED_PREFIX = ".github/workflows/";
-export const TAMPERED_REASON = "the agent modified .git configuration or hooks";
 
 /**
  * The environment is not ready (git fetch, docker build or the Docker daemon failed, the kit has no
@@ -60,8 +60,6 @@ export interface AgentRun {
 }
 
 export interface RunSandbox {
-  /** Host path of the worktree on `afk/<id>`. Used to capture git's directories before the agents run, and for nothing else. */
-  workdir: string;
   /** Run one agent to completion in the sandbox; rejects when the agent fails. */
   runAgent(run: AgentRun): Promise<void>;
   /** Contents of a file inside the sandbox, or null when it does not exist. */
@@ -73,11 +71,11 @@ export interface RunSandbox {
 
 export interface RunPorts {
   /**
-   * Create the worktree on `branch` (forked from `baseRef`, which has just been fetched) and start the
+   * Create the worktree on `branch` (forked from `baseRef`, which the run clone `runDir` has) and start the
    * sandbox with `env` set. Throws SetupError for an environment problem and IssueSetupError for an
    * issue-specific one; anything else is treated as a SetupError.
    */
-  openSandbox(o: { branch: string; baseRef: string; repoDir: string; env: Record<string, string> }): Promise<RunSandbox>;
+  openSandbox(o: { branch: string; baseRef: string; repoDir: string; runDir: string; env: Record<string, string> }): Promise<RunSandbox>;
   git: GitPorts;
   github: {
     /** Open a draft PR in `repo` (`owner/name`) from a neutral directory and return its URL. */
@@ -97,6 +95,8 @@ export interface RunInput {
   github: boolean;
   backlog: Backlog;
   ports: RunPorts;
+  /** Progress lines the operator should see, e.g. where a kept run clone is. Defaults to stderr. */
+  log?: (line: string) => void;
 }
 
 export type RunOutcome =
@@ -106,8 +106,9 @@ export type RunOutcome =
    * Nothing was pushed (or, for Backlog.md, only the label swap). `unmarked` is set when the backlog
    * could not record it, which for Backlog.md is always the case before a sandbox exists, because
    * the label swap is a commit on a pushed branch; the caller decides what to do with the issue.
+   * `keptClone` is the run clone, left on disk because the push failed and the work is in it.
    */
-  | { status: "blocked"; reason: string; unmarked?: true };
+  | { status: "blocked"; reason: string; unmarked?: true; keptClone?: string };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -148,33 +149,43 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     for (const name of AGENT_TOKEN_VARS[agent]) if (env[name]) sandboxEnv[name] = env[name];
   }
 
-  await ports.git.ensureExcluded(repoDir);
-  let sandbox: RunSandbox;
-  try {
-    sandbox = await ports.openSandbox({ branch, baseRef, repoDir, env: sandboxEnv });
-  } catch (e) {
-    if (e instanceof IssueSetupError) return blockEarly(e.message);
-    throw e instanceof SetupError ? e : new SetupError(`sandbox setup failed: ${message(e)}`, { cause: e });
-  }
-
+  const say = input.log ?? ((l: string) => console.error(l));
+  let run: RunClone | undefined;
+  let clean: CleanClone | undefined;
+  let sandbox: RunSandbox | undefined;
   let closed = false;
   const stopSandbox = async () => {
-    if (closed) return;
+    if (closed || !sandbox) return;
     closed = true;
     await sandbox.close();
   };
-  // The local worktree and branch are removed at the end unless something stayed unpushed.
-  let keepLocal = true;
-  let clean: CleanClone | undefined;
+  // The run clone is deleted on every path, except when the push of the work failed.
+  let keepRun = false;
 
   try {
-    // I1: before any agent runs, after the host fetch.
-    const snap = await ports.git.capture(repoDir, sandbox.workdir, config.baseBranch);
+    // Before any agent runs. Only these steps and the sandbox setup are the environment's to fail.
+    let snap: RunClone;
+    try {
+      const url = await ports.git.originUrl(repoDir);
+      snap = run = await ports.git.createRunClone(url, config.baseBranch, issue.id);
+    } catch (e) {
+      throw new SetupError(`cannot clone origin for the run: ${message(e)}`, { cause: e });
+    }
+    try {
+      sandbox = await ports.openSandbox({ branch, baseRef, repoDir, runDir: snap.dir, env: sandboxEnv });
+    } catch (e) {
+      if (e instanceof IssueSetupError) return await blockEarly(e.message);
+      throw e instanceof SetupError ? e : new SetupError(`sandbox setup failed: ${message(e)}`, { cause: e });
+    }
+    const box = sandbox;
     const cleanClone = async (tip: string | null): Promise<CleanClone> => {
       try {
         return (clean ??= await ports.git.createClean(snap, branch, tip));
       } catch (e) {
-        throw e instanceof SetupError ? e : new SetupError(`cannot prepare a clean clone: ${message(e)}`, { cause: e });
+        if (e instanceof ImportError || e instanceof SetupError) throw e;
+        keepRun = true; // the work cannot be pushed from here, so it must not be deleted
+        say(`afk: kept ${snap.dir} (the clean clone could not be prepared)`);
+        throw new SetupError(`cannot prepare a clean clone: ${message(e)}`, { cause: e });
       }
     };
 
@@ -188,7 +199,7 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
       FINDINGS_FILE,
     };
     const phase = async (role: "implementer" | "reviewer", agent: AgentName) =>
-      sandbox.runAgent({
+      box.runAgent({
         agent,
         model: modelFor(agent, role),
         prompt: renderPrompt(loadPrompt(role === "implementer" ? "implement" : "review", repoDir, ports.readText), vars),
@@ -205,35 +216,36 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     let findings: string | null = null;
     if (implementerFailure === null) {
       try {
-        await sandbox.removeFile(FINDINGS_FILE); // nothing an earlier phase left there counts as a finding
+        await box.removeFile(FINDINGS_FILE); // nothing an earlier phase left there counts as a finding
         await phase("reviewer", reviewer);
-        findings = await sandbox.readFile(FINDINGS_FILE).catch(() => null);
+        findings = await box.readFile(FINDINGS_FILE).catch(() => null);
       } catch (e) {
         reviewNote = `Review did not complete: the reviewer (${reviewer}) failed: ${message(e)}`;
       }
     }
 
-    // I2: stop the container before any host-side git step. The user's .git is put back first (the
-    // closing of the sandbox runs git in it) and once more after, in case the closing exposed it.
-    let tampered = await ports.git.restoreIfTampered(snap);
+    // Stop the container before any host-side git step.
     await stopSandbox();
-    tampered = (await ports.git.restoreIfTampered(snap)) || tampered;
 
     /**
      * Record that nothing is pushed. GitHub: label and comment. Backlog.md: in the clean clone, on
      * `afk/<id>` at the captured base commit, commit the label swap and push that one commit (the
      * branch keeps the claim). `pushFailed` means the work's own push failed, so there is no branch
-     * to record on; the work stays in the local branch and Backlog.md gets no mark.
+     * to record on; the work stays in the kept run clone and Backlog.md gets no mark.
      */
     const block = async (reason: string, pushFailed = false): Promise<RunOutcome> => {
-      let why = reason;
+      const why = reason;
+      if (pushFailed) {
+        keepRun = true;
+        say(`afk: kept ${snap.dir}: the push of ${branch} failed and the work is only there`);
+      }
+      const kept = pushFailed ? { keptClone: snap.dir } : {};
       if (!isMd) {
         await backlog.markBlocked(issue.id, why);
-        keepLocal = pushFailed;
-        return { status: "blocked", reason: why };
+        return { status: "blocked", reason: why, ...kept };
       }
       if (pushFailed) {
-        return { status: "blocked", reason: `${why}; the Backlog.md label swap was not recorded, and the work stays in the local branch ${branch}`, unmarked: true };
+        return { status: "blocked", reason: `${why}; the Backlog.md label swap was not recorded, and the work stays in the run clone ${snap.dir}`, unmarked: true, ...kept };
       }
       try {
         const c = await cleanClone(null);
@@ -243,7 +255,6 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
         const bad = await pushable(c, head, false);
         if (bad !== null) throw new Error(bad);
         await c.push(head);
-        keepLocal = false;
         return { status: "blocked", reason: why };
       } catch (e) {
         return { status: "blocked", reason: `${why}; recording the block on ${branch} failed (${message(e)}), so it stays unrecorded`, unmarked: true };
@@ -265,20 +276,24 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
       return null;
     };
 
-    if (tampered) return await block(TAMPERED_REASON);
     if (implementerFailure !== null) return await block(implementerFailure);
 
-    // I3: the one value read from the shared repository.
+    // The one value read from the run clone.
     let tip: string | null;
     try {
-      tip = await ports.git.readTip(snap, branch);
+      tip = await snap.readTip(branch);
     } catch (e) {
       return await block(`cannot read ${branch}: ${message(e)}`);
     }
     if (tip === null || !HEX40.test(tip)) return await block("the implementer made no commits");
 
-    // I4, I5
-    const c = await cleanClone(tip);
+    let c: CleanClone;
+    try {
+      c = await cleanClone(tip);
+    } catch (e) {
+      if (e instanceof ImportError) return await block(`the agent's commits cannot be imported: ${message(e)}`);
+      throw e;
+    }
     const bad = await pushable(c, tip, true);
     if (bad !== null) return await block(bad);
 
@@ -287,7 +302,6 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     } catch (e) {
       return await block(`pushing ${branch} failed: ${message(e)}`, true);
     }
-    keepLocal = false;
 
     // From here on nothing throws: the work is on the remote.
     const warnings: string[] = [];
@@ -339,8 +353,8 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     try {
       await stopSandbox();
     } finally {
-      await clean?.dispose().catch(() => {});
-      if (!keepLocal) await ports.git.removeLocal(repoDir, branch).catch(() => {});
+      await clean?.dispose().catch((e) => say(`afk: could not delete the clean clone: ${message(e)}`));
+      if (run && !keepRun) await run.dispose().catch((e) => say(`afk: could not delete ${run!.dir}: ${message(e)}`));
     }
   }
 }

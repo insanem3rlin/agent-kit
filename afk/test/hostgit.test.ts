@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -144,8 +143,8 @@ test("with a reftable run clone the tip comes from a hardened git command pinned
     return;
   }
   try {
-    const wt = agentWorktree(run);
-    const tip = commit(wt, "a.txt");
+    git(run.dir, "checkout", "-q", "-b", "afk/7");
+    const tip = commit(run.dir, "a.txt");
     // convert the run clone to reftable the way an agent (or a user's init.defaultRefFormat) could
     git(run.dir, "refs", "migrate", "--ref-format=reftable");
     assert.match(readFileSync(join(run.commonDir, "config"), "utf8"), /refstorage\s*=\s*reftable/i);
