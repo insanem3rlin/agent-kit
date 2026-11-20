@@ -66,9 +66,10 @@ def test_afk_launches_the_engine(env):
 
 @needs_node
 def test_afk_passes_the_engine_exit_code_through(env):
+    # Run outside any configured repository, the daemon fails at startup with one line on stderr.
     r = with_engine(env).run("afk")
     assert r.returncode == 1
-    assert "not implemented" in r.stdout
+    assert "agent-kit afk:" in r.stderr
 
 
 @needs_node
