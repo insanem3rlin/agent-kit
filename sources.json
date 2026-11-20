@@ -22,6 +22,7 @@
     }
   ],
   "claude_plugins": [
-    {"plugin": "mattpocock-skills", "marketplace": "claude-plugins-official"}
+    {"plugin": "mattpocock-skills", "marketplace": "claude-plugins-official"},
+    {"plugin": "frontend-design", "marketplace": "claude-plugins-official"}
   ]
 }

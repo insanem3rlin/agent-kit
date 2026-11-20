@@ -79,6 +79,8 @@ These rules apply to all prose, which covers replies, commit messages, pull requ
 - State the point itself. Framings such as "not just X, it's Y", openers that announce the answer, and a closing paragraph that restates the work are filler.
 - Give the absolute path when reporting where a created or changed file lives.
 - Express the size of work in files touched, steps and risk. Give a time estimate only when the user asks for one.
+- German prose is written and checked with the `texten-at` skill.
+- Frontend design work (pages, components, visual layouts, diagrams) loads the `frontend-design` skill before the first line is drawn.
 
 ## Knowledge
 
