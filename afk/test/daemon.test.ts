@@ -417,6 +417,26 @@ test("after SIGINT nothing new starts, and an interrupted run is neither notifie
   assert.ok(h.logs.some((l) => /interrupted/.test(l)));
 });
 
+test("a real block recorded during shutdown is notified and logged as a block", async () => {
+  const gate = deferred<void>();
+  const h = harness({
+    ready: [mk("1")],
+    notifyUrl: "https://notify.test/x",
+    run: async () => {
+      await gate.promise;
+      return { status: "blocked", reason: "the branch touches .github/workflows/**" };
+    },
+  });
+  h.start();
+  await until(() => h.started.length === 1);
+  h.signals.emit("SIGINT");
+  gate.resolve();
+  assert.equal(await h.done, 130);
+  assert.equal(h.fetches.length, 1);
+  assert.match(h.fetches[0].init.body as string, /workflows/);
+  assert.ok(!h.logs.some((l) => /nothing was recorded/.test(l)), h.logs.join("\n"));
+});
+
 test("a run that finishes ready during shutdown still gets its label swap and a notification", async () => {
   const gate = deferred<void>();
   const h = harness({
@@ -482,11 +502,8 @@ test("a SetupError racing with Ctrl+C does not start a back-off sleep", async ()
   const orig = h.deps.log!;
   h.deps.log = (line) => {
     orig(line);
-    if (/not ready/.test(line)) {
-      let p = Promise.resolve();
-      for (let i = 0; i < 4; i++) p = p.then(() => {});
-      void p.then(() => h.signals.emit("SIGINT"));
-    }
+    // One microtask after the log line, the "resched" has fired but pause() has not resumed yet.
+    if (/not ready/.test(line)) queueMicrotask(() => h.signals.emit("SIGINT"));
   };
   h.start();
   await until(() => h.started.length === 1);

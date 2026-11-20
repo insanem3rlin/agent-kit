@@ -171,16 +171,19 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
     finished.add(issue.id);
     backoffMs = 0;
     if (outcome.warning) say(`issue ${issue.id}: ${outcome.warning}`);
+    // Only runIssue's own interrupted outcome is silent; a real block recorded during shutdown is
+    // reported and notified like any other.
+    if (outcome.status === "blocked" && outcome.reason === INTERRUPTED) {
+      say(`issue ${issue.id} was interrupted by shutdown; nothing was recorded or sent`);
+      if (outcome.keptClone) say(`issue ${issue.id}: any work is kept in ${outcome.keptClone}`);
+      return;
+    }
     if (outcome.status === "ready") {
       say(`issue ${issue.id} is ready on ${outcome.branch}${outcome.prUrl ? ` (${outcome.prUrl})` : ""}`);
     } else {
       say(`issue ${issue.id} is blocked: ${outcome.reason}`);
       if (outcome.unmarked) say(`issue ${issue.id}: the backlog could not record the block (unmarked); it will not be picked again until the daemon restarts`);
       if (outcome.keptClone) say(`issue ${issue.id}: the work is kept in ${outcome.keptClone}`);
-    }
-    if (outcome.status === "blocked" && (ac.signal.aborted || outcome.reason === INTERRUPTED)) {
-      say(`issue ${issue.id} was interrupted by shutdown; nothing was recorded or sent`);
-      return;
     }
     await notify(notifyBody(issue, outcome));
     fire("wake");

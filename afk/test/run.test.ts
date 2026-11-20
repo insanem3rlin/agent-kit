@@ -548,10 +548,23 @@ test("an aborted Backlog.md run pushes nothing and calls no backlog method", asy
   const ac = new AbortController();
   const s = setup({ failAgent: () => (ac.abort(), new Error("sandbox closed")) });
   const out = await runIssue(input(s, { config: mdConfig, github: false, signal: ac.signal }));
-  assert.deepEqual(out, { status: "blocked", reason: "interrupted by shutdown", unmarked: true });
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(out.status === "blocked" && out.unmarked, true);
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string", "the run clone is kept: the implementer may have committed");
   assert.deepEqual(s.backlogCalls, []);
   assert.deepEqual(s.log.filter((l) => l.startsWith("backlog:") || l.startsWith("push:") || l.startsWith("clean:") || l.startsWith("checkout:")), []);
-  assert.ok(s.log.includes("disposeRun"), "the run clone is still deleted: nothing was pushed or lost");
+  assert.ok(!s.log.includes("disposeRun"), "the run clone is not deleted");
+});
+
+test("an abort during the reviewer phase publishes nothing and keeps the run clone", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: (r) => (r.name.endsWith("-reviewer") ? (ac.abort(), new Error("sandbox closed")) : undefined) });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(pushes(s), [], "no push");
+  assert.deepEqual(s.backlogCalls, [], "no label swap, no comment");
+  assert.ok(!s.log.includes("disposeRun"));
 });
 
 test("an aborted GitHub run does not relabel the issue either", async () => {
@@ -564,12 +577,7 @@ test("an aborted GitHub run does not relabel the issue either", async () => {
 
 test("an abort after the push does not stop the ready path", async () => {
   const ac = new AbortController();
-  const s = setup();
-  const sb = s.ports.openSandbox;
-  s.ports.openSandbox = async (o) => {
-    const box = await sb(o);
-    return { ...box, close: async () => (await box.close(), ac.abort()) };
-  };
+  const s = setup({ failPush: () => (ac.abort(), false) });
   const out = await runIssue(input(s, { signal: ac.signal }));
   assert.equal(out.status, "ready");
   assert.equal(s.backlogCalls.filter((c) => c.fn === "ready").length, 1);

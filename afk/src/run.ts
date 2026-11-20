@@ -237,6 +237,15 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     // Stop the container before any host-side git step.
     await stopSandbox();
 
+    // Shut down mid-run (in either phase): publish nothing, and keep the run clone, since the
+    // agents may have committed work that is only there.
+    const interruptedKeep = (): RunOutcome => {
+      keepRun = true;
+      say(`afk: kept ${snap.dir}: the run was interrupted by shutdown and any work is only there`);
+      return { ...interrupted(), keptClone: snap.dir };
+    };
+    if (input.signal?.aborted) return interruptedKeep();
+
     /**
      * Record that nothing is pushed. GitHub: label and comment. Backlog.md: in the clean clone, on
      * `afk/<id>` at the captured base commit, commit the label swap and push that one commit (the
@@ -308,6 +317,7 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     const bad = await pushable(c, tip, true);
     if (bad !== null) return await block(bad);
 
+    if (input.signal?.aborted) return interruptedKeep();
     try {
       await c.push(tip);
     } catch (e) {
