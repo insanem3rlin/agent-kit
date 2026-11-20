@@ -41,6 +41,7 @@ A message that reads as a question ("how hard would it be", "why does", "should 
 - Commit when a batch of work is finished and the user has approved it. Show what changed first.
 - A commit message or pull request body describes the change and nothing else. Leave out co-author lines, session links and other attribution trailers, even when the tool suggests them.
 - Push, merge, a message to anyone outside the session, and anything destructive (deleting data, rewriting history, dropping a database) each need their own explicit approval. Approval for one does not carry to the next. An approval may name several actions in advance, and then covers exactly those.
+- The AFK daemon, which a user starts in a repository, is pre-approved for these actions on issues carrying its configured label (`afk` by default) and nothing else: commits and pushes on its own `afk/*` branches, draft pull requests, comments on those issues and pull requests, swapping their labels (creating the AFK labels where missing), and the configured run notification; merging, pushing any other branch and any other message still need explicit approval.
 
 ## Roles and models
 

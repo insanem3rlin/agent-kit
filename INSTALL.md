@@ -79,6 +79,22 @@ Check these and stop with a clear message if one fails.
    - A repository conflict: report it. A repository's rules win over the kit's for that repository, and projects differ on purpose.
    - A leak: report the file, the line and the kind of secret. Do not edit it.
 
+## AFK prerequisites (optional)
+
+The install above does not need these. They matter only for `agent-kit afk`, the unattended issue runner described in the README. When the user wants AFK runs, check and set up the following. `agent-kit doctor` reports the Node version and only the docker CLI version (`docker --version`), so use `docker info` to check that the daemon runs.
+
+1. Node 22.18 or newer (`node --version`). `agent-kit afk` refuses to start on an older one.
+2. A running Docker daemon (`docker info` succeeds). The runs happen in Docker sandboxes.
+3. The per-machine secrets file `~/.config/agent-kit/afk.env`, or `$AGENT_KIT_CONFIG/afk.env` when that variable is set. It holds `KEY=VALUE` lines:
+
+   - `GH_TOKEN`, needed when the repository is on GitHub.
+   - A token for each agent the repository's `.afk/config.json` uses: `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` for `claude`, `OPENAI_API_KEY` for `codex`, `CURSOR_API_KEY` for `cursor`.
+   - `AFK_NOTIFY_URL`, optional. The daemon POSTs its notifications to it as plain text.
+
+   The file contains secrets. Never commit it, copy it into a repository or print its values. The user creates it; do not ask for their tokens in chat.
+
+The engine's npm dependencies install by themselves (`npm ci`) on the first `agent-kit afk` run, so npm must be available then. Per repository, the user runs `agent-kit afk init` and then `agent-kit afk`.
+
 ## What the install changes
 
 Tell the user this list in your report, limited to the tools that were found.
