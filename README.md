@@ -60,6 +60,23 @@ npm run lint && npm run typecheck && npm test -- --changed
 
 Agents run it after each change and show its output before reporting work as done. Keep it fast; it is not the full suite.
 
+## AFK
+
+Label an issue `afk` and a daemon running in that repository takes it from there. It starts an implementer and then a reviewer inside a Docker sandbox, pushes an `afk/<id>` branch and opens a draft pull request on GitHub. A human reviews and merges it.
+
+```sh
+agent-kit afk init    # scaffolds .afk/config.json and .afk/Dockerfile
+agent-kit afk         # runs the daemon in this repository; stop it with Ctrl+C
+```
+
+`init` writes a default config (GitHub backlog, `claude` as implementer and reviewer, one run at a time). Review it, and put `GH_TOKEN` and the agent tokens in `~/.config/agent-kit/afk.env` first; [`INSTALL.md`](INSTALL.md) lists the prerequisites.
+
+- **Labels.** `afk` hands an issue over. `afk:<agent>` (`afk:claude`, `afk:codex` or `afk:cursor`) picks the implementer for that issue instead of the configured one. When a run ends, `ready-for-human` replaces `afk`. `afk-blocked` marks a run that pushed no work, with a comment giving the reason.
+- **Backlogs.** Issues are GitHub issues or Backlog.md tasks committed in the repository, set by `backlog` in `.afk/config.json`.
+- **Limits.** A run never merges, never pushes to the base branch and never edits `.github/workflows/**`.
+
+The terms are defined in [`GLOSSARY.md`](GLOSSARY.md). The decisions behind it are [ADR 0001](docs/adr/0001-afk-reviewer-fixes-standards-itself.md), [ADR 0002](docs/adr/0002-afk-engine-on-sandcastle.md) and [ADR 0003](docs/adr/0003-afk-blocked-backlog-md-run-pushes-the-swap-branch.md).
+
 ## Design
 
 - **Short rules, mechanical checks.** A rule that a script can check becomes a hook or part of the verify command. Prose is what is left.
