@@ -40,6 +40,7 @@ interface Harness {
   ready: BacklogIssue[];
   rejected: RejectedIssue[];
   blocked: { id: string; reason: string }[];
+  readyMarked: string[];
   started: string[];
   fetches: { url: string; init: RequestInit }[];
   done: Promise<number>;
@@ -58,7 +59,7 @@ interface Options {
 }
 
 function harness(o: Options = {}): Harness {
-  const h = { logs: [], sleeps: [], exits: [], blocked: [], started: [], fetches: [], signals: new EventEmitter(), ready: o.ready ?? [], rejected: o.rejected ?? [] } as unknown as Harness;
+  const h = { logs: [], sleeps: [], exits: [], blocked: [], readyMarked: [], started: [], fetches: [], signals: new EventEmitter(), ready: o.ready ?? [], rejected: o.rejected ?? [] } as unknown as Harness;
   const backlog: Backlog = {
     async listReady() {
       return h.ready;
@@ -70,7 +71,9 @@ function harness(o: Options = {}): Harness {
       if (o.failMarkBlocked) throw new Error("gh is down");
       h.blocked.push({ id, reason });
     },
-    async markReadyForHuman() {},
+    async markReadyForHuman(id) {
+      h.readyMarked.push(id);
+    },
     async comment() {},
   };
   const ports = {
@@ -181,6 +184,19 @@ test("a failing markBlocked is logged and the loop keeps polling", async () => {
   assert.ok(h.logs.some((l) => /^afk: .*9.*gh is down/.test(l)), h.logs.join("\n"));
   h.signals.emit("SIGINT");
   assert.equal(await h.done, 130);
+});
+
+test("a rejected issue that cannot be marked is reported once, not on every poll", async () => {
+  const h = harness({ rejected: [{ id: "9", reason: "bad" }], failMarkBlocked: true });
+  h.start();
+  await nextPoll(h);
+  await nextPoll(h);
+  await nextPoll(h);
+  await until(() => h.sleeps.length > 0);
+  assert.equal(h.logs.filter((l) => /could not mark rejected issue 9/.test(l)).length, 1);
+  assert.ok(h.logs.some((l) => /only in this log|reported in this log/.test(l)));
+  h.signals.emit("SIGINT");
+  await h.done;
 });
 
 test("a failing listReady is logged and the loop keeps polling", async () => {
@@ -375,27 +391,109 @@ test("SIGINT stops polling, closes every live sandbox, waits for the runs and ex
   await box!.close();
 });
 
-test("after SIGINT nothing new starts, and a run interrupted by it is neither relabelled nor notified", async () => {
-  const gate = deferred<RunOutcome>();
+test("after SIGINT nothing new starts, and an interrupted run is neither notified nor relabelled by the daemon", async () => {
+  const gate = deferred<void>();
+  let signal: AbortSignal | undefined;
   const h = harness({
     ready: [mk("1"), mk("2")],
     concurrency: 1,
     notifyUrl: "https://notify.test/x",
     run: async (input) => {
+      signal = input.signal;
       await gate.promise;
-      await input.backlog.markBlocked(input.issue.id, "the agent died");
-      return { status: "blocked", reason: "the agent died" };
+      return { status: "blocked", reason: "interrupted by shutdown", unmarked: true };
     },
   });
   h.start();
   await until(() => h.started.length === 1);
+  assert.equal(signal?.aborted, false);
   h.signals.emit("SIGINT");
-  gate.resolve({ status: "ready", branch: "x" });
+  assert.equal(signal?.aborted, true, "the run's signal is aborted when shutdown starts");
+  gate.resolve();
   assert.equal(await h.done, 130);
   assert.deepEqual(h.started, ["1"]);
   assert.deepEqual(h.blocked, []);
   assert.deepEqual(h.fetches, []);
   assert.ok(h.logs.some((l) => /interrupted/.test(l)));
+});
+
+test("a run that finishes ready during shutdown still gets its label swap and a notification", async () => {
+  const gate = deferred<void>();
+  const h = harness({
+    ready: [mk("1")],
+    notifyUrl: "https://notify.test/x",
+    run: async (input) => {
+      await gate.promise;
+      await input.backlog.markReadyForHuman(input.issue.id, "done");
+      return { status: "ready", branch: "afk/1" };
+    },
+  });
+  h.start();
+  await until(() => h.started.length === 1);
+  h.signals.emit("SIGINT");
+  gate.resolve();
+  assert.equal(await h.done, 130);
+  assert.deepEqual(h.readyMarked, ["1"]);
+  assert.equal(h.fetches.length, 1);
+});
+
+test("a sandbox that finishes opening after Ctrl+C is closed at once and the run gets an error", async () => {
+  const gate = deferred<void>();
+  const events: string[] = [];
+  let results: string[] = [];
+  const h = harness({
+    ready: [mk("1"), mk("2")],
+    concurrency: 2,
+    run: async (input) => {
+      try {
+        await input.ports.openSandbox({ branch: `afk/${input.issue.id}`, baseRef: "r", repoDir: "/repo", runDir: "/run", env: {} });
+        results.push(`${input.issue.id}:opened`);
+      } catch (e) {
+        results.push(`${input.issue.id}:${(e as Error).message}`);
+      }
+      return { status: "blocked", reason: "interrupted by shutdown", unmarked: true };
+    },
+  });
+  h.deps.ports.openSandbox = async (o) => {
+    events.push(`open:${o.branch}`);
+    await gate.promise;
+    return { runAgent: async () => {}, readFile: async () => null, removeFile: async () => {}, close: async () => void events.push(`close:${o.branch}`) };
+  };
+  h.start();
+  await until(() => events.includes("open:afk/1"));
+  h.signals.emit("SIGINT");
+  gate.resolve();
+  assert.equal(await h.done, 130);
+  assert.deepEqual(events, ["open:afk/1", "close:afk/1"], "the open in flight is closed, the queued open never starts");
+  assert.equal(results.length, 2);
+  assert.ok(results.every((r) => !r.endsWith(":opened")), results.join());
+});
+
+test("a SetupError racing with Ctrl+C does not start a back-off sleep", async () => {
+  const gate = deferred<void>();
+  const h = harness({
+    ready: [mk("1")],
+    concurrency: 1,
+    run: async () => {
+      await gate.promise;
+      throw new SetupError("docker is not running");
+    },
+  });
+  const orig = h.deps.log!;
+  h.deps.log = (line) => {
+    orig(line);
+    if (/not ready/.test(line)) {
+      let p = Promise.resolve();
+      for (let i = 0; i < 4; i++) p = p.then(() => {});
+      void p.then(() => h.signals.emit("SIGINT"));
+    }
+  };
+  h.start();
+  await until(() => h.started.length === 1);
+  await until(() => h.sleeps.length > 0);
+  gate.resolve();
+  assert.equal(await h.done, 130);
+  assert.deepEqual(h.sleeps.filter((s) => s.ms > DEFAULT_POLL_MS), []);
 });
 
 test("a second Ctrl+C exits at once", async () => {

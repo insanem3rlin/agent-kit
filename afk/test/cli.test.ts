@@ -44,6 +44,15 @@ test("outside a git repository the daemon prints one line and exits 1", async ()
   assert.match(r.out, /^agent-kit afk: .*git repository.*\n$/);
 });
 
+test("startup failures go to the error writer, not the output writer", async () => {
+  let out = "";
+  let err = "";
+  const code = await run([], (t) => (out += t), tmp(), (t) => (err += t));
+  assert.equal(code, 1);
+  assert.equal(out, "");
+  assert.match(err, /^agent-kit afk: .*git repository/);
+});
+
 test("without .afk/config.json the daemon prints one line and exits 1", async () => {
   const r = await capture([], gitRepo());
   assert.equal(r.code, 1);

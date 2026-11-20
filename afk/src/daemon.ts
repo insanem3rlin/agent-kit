@@ -9,13 +9,14 @@
 //   remembered, and the next poll waits longer each time (doubling, capped), until a run gets through.
 // - Sandbox creation is serialized by a mutex around ports.openSandbox, so image builds and container
 //   starts never race. Nothing else is shared between runs: each has its own disposable clone.
-// - On shutdown the sandboxes are closed first, which makes the agents of the in-flight runs fail. Those
-//   runs must not be reported as blocked on the backlog, so the backlog writes are switched off once
-//   shutdown starts, and a blocked outcome is logged as interrupted instead of notified.
+// - On shutdown every run's AbortSignal is aborted before the sandboxes are closed. Closing makes the
+//   agents fail, and runIssue then records nothing for an aborted run (it returns INTERRUPTED), so the
+//   interruption never labels an issue. A run that already pushed finishes its label swap normally.
+//   A sandbox that is still opening when shutdown starts is closed as soon as it exists.
 import type { Backlog } from "./backlog/types.ts";
 import type { AfkConfig } from "./config.ts";
 import type { AfkEnv } from "./env.ts";
-import { SetupError, runIssue } from "./run.ts";
+import { INTERRUPTED, SetupError, runIssue } from "./run.ts";
 import type { RunInput, RunOutcome, RunPorts, RunSandbox } from "./run.ts";
 
 export const DEFAULT_POLL_MS = 60_000;
@@ -93,6 +94,8 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
   const inFlight = new Map<string, Promise<void>>();
   const finished = new Set<string>();
   const liveSandboxes = new Set<RunSandbox>();
+  const aborts = new Set<AbortController>();
+  const reportedRejected = new Set<string>();
 
   // One pending loop event; the first to fire wins until the loop consumes it.
   let event = newEvent();
@@ -107,7 +110,12 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
   let openChain: Promise<unknown> = Promise.resolve();
   const openSandbox: RunPorts["openSandbox"] = (o) => {
     const result = openChain.then(async () => {
+      if (stopping) throw new Error("the daemon is shutting down");
       const sandbox = await deps.ports.openSandbox(o);
+      if (stopping) {
+        await sandbox.close().catch(() => {});
+        throw new Error("the daemon is shutting down");
+      }
       liveSandboxes.add(sandbox);
       return {
         ...sandbox,
@@ -121,21 +129,6 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
     return result;
   };
   const ports: RunPorts = { ...deps.ports, openSandbox };
-
-  // Backlog writes stop once shutdown starts (see the header).
-  const skipWhenStopping =
-    <A extends unknown[]>(name: string, fn: (...a: A) => Promise<void>) =>
-    async (id: string, ...rest: A): Promise<void> => {
-      if (stopping) return say(`shutting down, so ${name} for issue ${id} was skipped`);
-      await (fn as (id: string, ...a: unknown[]) => Promise<void>)(id, ...rest);
-    };
-  const backlog: Backlog = {
-    listReady: () => deps.backlog.listReady(),
-    listRejected: () => deps.backlog.listRejected(),
-    markBlocked: skipWhenStopping("markBlocked", (id: string, reason: string, ctx?: Parameters<Backlog["markBlocked"]>[2]) => deps.backlog.markBlocked(id, reason, ctx)) as Backlog["markBlocked"],
-    markReadyForHuman: skipWhenStopping("markReadyForHuman", (id: string, c: string, ctx?: Parameters<Backlog["markReadyForHuman"]>[2]) => deps.backlog.markReadyForHuman(id, c, ctx)) as Backlog["markReadyForHuman"],
-    comment: skipWhenStopping("comment", (id: string, body: string, ctx?: Parameters<Backlog["comment"]>[2]) => deps.backlog.comment(id, body, ctx)) as Backlog["comment"],
-  };
 
   async function notify(text: string): Promise<void> {
     if (!notifyUrl) return;
@@ -155,10 +148,14 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
   async function runOne(issue: { id: string; title: string; body: string; url: string; agent?: RunInput["issue"]["agent"] }): Promise<void> {
     say(`starting issue ${issue.id} "${issue.title}"`);
     let outcome: RunOutcome;
+    const ac = new AbortController();
+    aborts.add(ac);
     try {
-      outcome = await run({ issue, config, env, repoDir: deps.repoDir, github: deps.github, backlog, ports, log: raw });
+      outcome = await run({ issue, config, env, repoDir: deps.repoDir, github: deps.github, backlog: deps.backlog, ports, log: raw, signal: ac.signal });
     } catch (e) {
-      if (e instanceof SetupError) {
+      if (stopping) {
+        say(`issue ${issue.id} was interrupted by shutdown (${message(e)}); nothing was recorded or sent`);
+      } else if (e instanceof SetupError) {
         backoffMs = Math.min(maxBackoffMs, backoffMs ? backoffMs * 2 : pollMs * 2);
         say(`issue ${issue.id}: the environment is not ready (${e.message}); retrying in ${Math.round(backoffMs / 1000)}s, the issue is untouched`);
         fire("resched");
@@ -168,6 +165,8 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
         fire("wake");
       }
       return;
+    } finally {
+      aborts.delete(ac);
     }
     finished.add(issue.id);
     backoffMs = 0;
@@ -179,7 +178,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
       if (outcome.unmarked) say(`issue ${issue.id}: the backlog could not record the block (unmarked); it will not be picked again until the daemon restarts`);
       if (outcome.keptClone) say(`issue ${issue.id}: the work is kept in ${outcome.keptClone}`);
     }
-    if (stopping && outcome.status === "blocked") {
+    if (outcome.status === "blocked" && (ac.signal.aborted || outcome.reason === INTERRUPTED)) {
       say(`issue ${issue.id} was interrupted by shutdown; nothing was recorded or sent`);
       return;
     }
@@ -189,13 +188,16 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
 
   async function poll(): Promise<void> {
     try {
-      for (const r of await backlog.listRejected()) {
+      for (const r of await deps.backlog.listRejected()) {
         if (stopping) return;
         if (inFlight.has(r.id)) continue;
         try {
-          await backlog.markBlocked(r.id, r.reason);
+          await deps.backlog.markBlocked(r.id, r.reason);
         } catch (e) {
+          if (reportedRejected.has(r.id)) continue;
+          reportedRejected.add(r.id);
           say(`could not mark rejected issue ${r.id} blocked: ${message(e)}`);
+          say(`rejected issue ${r.id} stays unmarked and is reported only in this log (once per daemon run): ${r.reason}`);
         }
       }
     } catch (e) {
@@ -204,7 +206,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
     if (stopping) return;
     let ready;
     try {
-      ready = await backlog.listReady();
+      ready = await deps.backlog.listReady();
     } catch (e) {
       say(`could not list ready issues: ${message(e)}`);
       return;
@@ -220,6 +222,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
   /** Wait for the next poll: the poll interval (or the back-off), a finished run, or shutdown. */
   async function pause(): Promise<void> {
     for (;;) {
+      if (stopping) return;
       const ac = new AbortController();
       const kind = await Promise.race([sleep(backoffMs || pollMs, ac.signal).then((): LoopEvent | "timer" => "timer"), event.promise]);
       ac.abort();
@@ -243,6 +246,7 @@ export async function runDaemon(deps: DaemonDeps): Promise<number> {
   let shutdownDone: Promise<void> | undefined;
   async function shutdown(): Promise<void> {
     say("shutting down: closing sandboxes and waiting for the runs in flight");
+    for (const ac of aborts) ac.abort();
     fire("stop");
     await Promise.allSettled([...liveSandboxes].map((s) => s.close()));
     const ac = new AbortController();

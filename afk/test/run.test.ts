@@ -543,3 +543,34 @@ test("an issue-specific setup failure marks a GitHub issue blocked", async () =>
   assert.deepEqual(out, { status: "blocked", reason: "branch afk/7 is checked out elsewhere" });
   assert.deepEqual(s.backlogCalls.map((c) => [c.fn, c.hasCtx]), [["blocked", false]]);
 });
+
+test("an aborted Backlog.md run pushes nothing and calls no backlog method", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: () => (ac.abort(), new Error("sandbox closed")) });
+  const out = await runIssue(input(s, { config: mdConfig, github: false, signal: ac.signal }));
+  assert.deepEqual(out, { status: "blocked", reason: "interrupted by shutdown", unmarked: true });
+  assert.deepEqual(s.backlogCalls, []);
+  assert.deepEqual(s.log.filter((l) => l.startsWith("backlog:") || l.startsWith("push:") || l.startsWith("clean:") || l.startsWith("checkout:")), []);
+  assert.ok(s.log.includes("disposeRun"), "the run clone is still deleted: nothing was pushed or lost");
+});
+
+test("an aborted GitHub run does not relabel the issue either", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: () => (ac.abort(), new Error("sandbox closed")) });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.deepEqual(s.backlogCalls, []);
+});
+
+test("an abort after the push does not stop the ready path", async () => {
+  const ac = new AbortController();
+  const s = setup();
+  const sb = s.ports.openSandbox;
+  s.ports.openSandbox = async (o) => {
+    const box = await sb(o);
+    return { ...box, close: async () => (await box.close(), ac.abort()) };
+  };
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(out.status, "ready");
+  assert.equal(s.backlogCalls.filter((c) => c.fn === "ready").length, 1);
+});

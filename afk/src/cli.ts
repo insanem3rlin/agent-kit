@@ -18,7 +18,7 @@ Run the AFK daemon in the current repository until Ctrl+C.
 init  scaffold .afk/ (config.json and a Dockerfile) in the current repository.
 `;
 
-export async function run(argv: string[], write: (text: string) => void, cwd: string = process.cwd()): Promise<number> {
+export async function run(argv: string[], write: (text: string) => void, cwd: string = process.cwd(), writeErr: (text: string) => void = write): Promise<number> {
   if (argv.includes("--help") || argv.includes("-h")) {
     write(USAGE);
     return 0;
@@ -37,7 +37,7 @@ export async function run(argv: string[], write: (text: string) => void, cwd: st
     return await startDaemon(cwd);
   } catch (e) {
     // Startup failures (no repository, config, afk.env or secrets): one line, exit 1.
-    write(`agent-kit afk: ${(e as Error).message.split("\n")[0]}\n`);
+    writeErr(`agent-kit afk: ${(e as Error).message.split("\n")[0]}\n`);
     return 1;
   }
 }
