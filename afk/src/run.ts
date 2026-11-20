@@ -97,6 +97,11 @@ export interface RunInput {
   ports: RunPorts;
   /** Progress lines the operator should see, e.g. where a kept run clone is. Defaults to stderr. */
   log?: (line: string) => void;
+  /**
+   * Aborted when the daemon shuts down. A run that did not push its work then records nothing: no
+   * label, no comment, no claim branch, because the interruption says nothing about the issue.
+   */
+  signal?: AbortSignal;
 }
 
 export type RunOutcome =
@@ -115,6 +120,9 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 /** The issue text is data, fenced in the prompt; it must not be able to write its own closing fence. */
 const defence = (text: string) => text.replace(/<\/(untrusted-issue)/gi, "<\\/$1");
 
+/** The reason of a run that was stopped by the daemon's shutdown and recorded nothing. */
+export const INTERRUPTED = "interrupted by shutdown";
+
 const HEX40 = /^[0-9a-f]{40}$/;
 
 export async function runIssue(input: RunInput): Promise<RunOutcome> {
@@ -129,7 +137,9 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
 
   // A block before any sandbox exists. GitHub can label right away; Backlog.md records a block as a
   // commit on a pushed branch, which does not exist yet, so the caller gets the reason unmarked.
+  const interrupted = (): RunOutcome => ({ status: "blocked", reason: INTERRUPTED, unmarked: true });
   const blockEarly = async (reason: string): Promise<RunOutcome> => {
+    if (input.signal?.aborted) return interrupted();
     if (isMd) return { status: "blocked", reason, unmarked: true };
     await backlog.markBlocked(issue.id, reason);
     return { status: "blocked", reason };
@@ -227,6 +237,15 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     // Stop the container before any host-side git step.
     await stopSandbox();
 
+    // Shut down mid-run (in either phase): publish nothing, and keep the run clone, since the
+    // agents may have committed work that is only there.
+    const interruptedKeep = (): RunOutcome => {
+      keepRun = true;
+      say(`afk: kept ${snap.dir}: the run was interrupted by shutdown and any work is only there`);
+      return { ...interrupted(), keptClone: snap.dir };
+    };
+    if (input.signal?.aborted) return interruptedKeep();
+
     /**
      * Record that nothing is pushed. GitHub: label and comment. Backlog.md: in the clean clone, on
      * `afk/<id>` at the captured base commit, commit the label swap and push that one commit (the
@@ -240,6 +259,7 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
         say(`afk: kept ${snap.dir}: the push of ${branch} failed and the work is only there`);
       }
       const kept = pushFailed ? { keptClone: snap.dir } : {};
+      if (input.signal?.aborted) return interruptedKeep();
       if (!isMd) {
         await backlog.markBlocked(issue.id, why);
         return { status: "blocked", reason: why, ...kept };
@@ -297,6 +317,7 @@ export async function runIssue(input: RunInput): Promise<RunOutcome> {
     const bad = await pushable(c, tip, true);
     if (bad !== null) return await block(bad);
 
+    if (input.signal?.aborted) return interruptedKeep();
     try {
       await c.push(tip);
     } catch (e) {

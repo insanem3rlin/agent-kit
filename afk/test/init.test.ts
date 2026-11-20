@@ -92,13 +92,13 @@ test("init refuses to overwrite an existing .afk and leaves it untouched", () =>
   assert.equal(existsSync(join(dir, ".afk", "Dockerfile")), false);
 });
 
-test("the cli routes `init` to the scaffold, in the given directory", () => {
+test("the cli routes `init` to the scaffold, in the given directory", async () => {
   const dir = repo("main");
   let out = "";
-  assert.equal(run(["init"], (t) => (out += t), dir), 0);
+  assert.equal(await run(["init"], (t) => (out += t), dir), 0);
   assert.match(out, /\.afk/);
   assert.equal(loadConfig(dir).implementer, "claude");
   out = "";
-  assert.equal(run(["init"], (t) => (out += t), dir), 1);
+  assert.equal(await run(["init"], (t) => (out += t), dir), 1);
   assert.match(out, /already exists/);
 });

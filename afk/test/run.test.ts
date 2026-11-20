@@ -543,3 +543,73 @@ test("an issue-specific setup failure marks a GitHub issue blocked", async () =>
   assert.deepEqual(out, { status: "blocked", reason: "branch afk/7 is checked out elsewhere" });
   assert.deepEqual(s.backlogCalls.map((c) => [c.fn, c.hasCtx]), [["blocked", false]]);
 });
+
+test("an aborted Backlog.md run pushes nothing and calls no backlog method", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: () => (ac.abort(), new Error("sandbox closed")) });
+  const out = await runIssue(input(s, { config: mdConfig, github: false, signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(out.status === "blocked" && out.unmarked, true);
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string", "the run clone is kept: the implementer may have committed");
+  assert.deepEqual(s.backlogCalls, []);
+  assert.deepEqual(s.log.filter((l) => l.startsWith("backlog:") || l.startsWith("push:") || l.startsWith("clean:") || l.startsWith("checkout:")), []);
+  assert.ok(!s.log.includes("disposeRun"), "the run clone is not deleted");
+});
+
+test("an abort during the reviewer phase publishes nothing and keeps the run clone", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: (r) => (r.name.endsWith("-reviewer") ? (ac.abort(), new Error("sandbox closed")) : undefined) });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(pushes(s), [], "no push");
+  assert.deepEqual(s.backlogCalls, [], "no label swap, no comment");
+  assert.ok(!s.log.includes("disposeRun"));
+});
+
+test("an aborted GitHub run does not relabel the issue either", async () => {
+  const ac = new AbortController();
+  const s = setup({ failAgent: () => (ac.abort(), new Error("sandbox closed")) });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.deepEqual(s.backlogCalls, []);
+});
+
+/** A setup whose signal aborts while the clean clone is being prepared, after the agents finished. */
+function abortDuringImport(o: Options = {}) {
+  const ac = new AbortController();
+  const s = setup(o);
+  const create = s.ports.git.createClean;
+  s.ports.git.createClean = async (snap, branch, tip) => {
+    ac.abort();
+    return create(snap, branch, tip);
+  };
+  return { ac, s };
+}
+
+test("an abort during the host-side checks, with clean guards, does not push and keeps the run clone", async () => {
+  const { ac, s } = abortDuringImport();
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(pushes(s), []);
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.includes("disposeRun"));
+});
+
+test("an abort during the host-side checks, when a guard then fails, still keeps the run clone", async () => {
+  const { ac, s } = abortDuringImport({ merges: 1 });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(reason(out), "interrupted by shutdown");
+  assert.equal(typeof (out.status === "blocked" && out.keptClone), "string");
+  assert.deepEqual(s.backlogCalls, []);
+  assert.ok(!s.log.includes("disposeRun"));
+});
+
+test("an abort after the push does not stop the ready path", async () => {
+  const ac = new AbortController();
+  const s = setup({ failPush: () => (ac.abort(), false) });
+  const out = await runIssue(input(s, { signal: ac.signal }));
+  assert.equal(out.status, "ready");
+  assert.equal(s.backlogCalls.filter((c) => c.fn === "ready").length, 1);
+});

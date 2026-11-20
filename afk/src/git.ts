@@ -66,9 +66,14 @@ export function isGithubUrl(url: string): boolean {
   }
 }
 
+/** The URL of the `origin` remote of the repository at `dir`, or null when it has none. */
+export function originUrl(dir: string): string | null {
+  return git(dir, "remote", "get-url", "origin");
+}
+
 /** Whether the `origin` remote of the repository at `dir` is on GitHub. */
 export function originOnGithub(dir: string): boolean {
-  const url = git(dir, "remote", "get-url", "origin");
+  const url = originUrl(dir);
   return url !== null && isGithubUrl(url);
 }
 
